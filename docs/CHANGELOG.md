@@ -1,0 +1,2849 @@
+---
+title: RTFM Changelog
+description: >-
+  Release notes for RTFM (rtfm-ai) — every version since 0.1.0 with
+  added features, bug fixes, and breaking changes.
+---
+
+# Changelog
+
+## [0.55.1] — 2026-10-22
+
+### Fixed — OpenDocument files lost their title and author
+
+Every `.odt` file was indexed under its file name, with no author: the
+title and author were looked up in the wrong part of the OpenDocument
+library, and the failure was silent. They are now read from the
+document's own metadata. Run `rtfm reindex --ext .odt` in a project to pick them up.
+
+## [0.55.0] — 2026-10-18
+
+### Changed — the memory hook runs in the background, quietly, once at a time
+
+The global end-of-session hook (`rtfm memory --install-hook`) ran in every
+session, agents' sandboxes included, where RTFM's Python is out of sight:
+each of those session ends reported "not found". It also held the end of
+every session while it read all projects' memory (about 5 s here). It now
+runs in the background, says nothing when RTFM cannot be reached, and runs
+one pass at a time — several sessions ending together start one pass.
+Rerun `rtfm memory --install-hook` to get the new entry.
+
+### Fixed — a memory directory shared by a link was indexed twice
+
+A project whose memory directory is a link to another project's had the
+same files indexed under both names; they fought over one entry and every
+pass ended in "UNIQUE constraint failed". Each directory is now indexed
+once, under the project that holds it, and the duplicate is taken out.
+
+### Fixed — installing a hook rewrote accented text in Claude Code settings
+
+Writing `settings.json` turned every non-ASCII character of the user's
+other settings into `\u` escapes. It is now written as it was read.
+
+## [0.54.0] — 2026-10-15
+
+### Changed — every `.gitignore` of a source counts
+
+Only the root `.gitignore` was read. A tool that keeps its own `.gitignore`
+in its directory — a ticket tracker beside its database, a build cache —
+had its internals indexed anyway: on one project, files rewritten at every
+ticket operation were re-indexed hundreds of times a day. Each `.gitignore`
+now applies below its directory, a deeper one overriding a shallower one,
+and nothing is brought back from inside an ignored directory, as in git.
+The scan and the change watcher no longer enter a directory a rule leaves
+out. A `.gitignore` that changes anywhere in the tree triggers a scan.
+
+### Fixed — a file a new ignore rule leaves out leaves the index
+
+A file indexed before a rule appeared stayed in the index for good: the
+scan stopped offering it, and the removal was held back because the file
+was still on disk. A build cache that git was told to ignore kept 1,678
+files searchable that way. A file an ignore rule now leaves out is taken
+out at the next scan, present or not. The removal checks the rule again
+before acting, so a rule taken back in between keeps the file; an ignore
+file that cannot be read adds no rule, so a mount gone dark removes nothing.
+
+## [0.53.0] — 2026-10-14
+
+### Changed — the sync hooks run in the background
+
+The prompt hook and the end-of-turn hook held the session while they
+indexed what the agent had edited. Measured on one machine over a day, the
+prompt hook reached its 10-second limit 25 times out of 25, the end-of-turn
+hook took up to 34 seconds. Both now run in the background (Claude Code
+`async` hooks, 120-second limit there); the hook that only notes an edited
+path stays in line.
+
+- The index can lag a few seconds behind an edit.
+- Two drains no longer run at once: the second finds the drain lock held
+  and leaves; what it would have taken waits for the next one.
+- A drain takes the edit list whole by renaming it, so a path noted while
+  it runs lands in a fresh list and is not lost.
+- A drain cut short (the session closed) leaves what it took behind; the
+  next drain, from either hook, takes it up.
+
+### Fixed — the extras stopped loading after a Python upgrade
+
+The extras venv (`rtfm-install-extras`) is tied to the Python it was built
+on. After the system moved from Python 3.12 to 3.14, it still started but
+found none of its packages: no semantic search, no PDF, office or audio
+reading. Running `rtfm-install-extras` now rebuilds a venv built on another
+Python version, and lists what was installed in it before.
+
+## [0.52.0] — 2026-10-09
+
+### Changed — an agent's git worktree is served from the main tree's index
+
+Agents work in their own copy of a repository (`git worktree add`), often in
+a sandbox where everything outside the copy is read-only. Started there,
+RTFM took the copy for a new project: it built a full second index inside
+it (about 200 MB on one repository), added its section to the copy's
+CLAUDE.md, wrote `.claude/settings.local.json` and enrolled the copy with
+the shared indexer — dirtying a tree that must hold only the agent's work,
+and blocking the fast-forward that brings that work back.
+
+A linked worktree is now recognised from the files git leaves (no git
+command run), and:
+
+- the session start writes nothing in the copy — no index, no CLAUDE.md
+  section, no settings, no enrolment; the edit hooks do nothing there;
+- search is answered from the main tree's index, opened read-only, and
+  works when that index, `~/.rtfm` and the main `.git` are read-only;
+- results point into the copy, so the agent reads and edits its own files;
+  reading a file goes to the copy's version, so the agent sees its edits;
+- nothing is queued into the main index from the copy.
+
+The main index does not hold the agent's edits: a search finds passages as
+they are in the main tree, and reading the file shows the copy's version.
+
+### Fixed — the server's log created `.rtfm/` wherever a session opened
+
+The log line written at server start created the index directory when it
+did not exist, in any directory a session was opened in. It now writes only
+into an index directory that already exists.
+
+## [0.51.0] — 2026-10-07
+
+### Added — MIDI files and audio files are read
+
+Until now both were skipped as binaries nothing could read.
+
+- **MIDI** (`.mid`, `.midi`, `.kar`, `.rmi`), with nothing to install: the
+  piece's title, format, duration, tempo and its changes, time signature,
+  key, copyright, markers, General MIDI instruments by channel (channel 10
+  as percussion), note count and range; then for each track its name,
+  instrument, programs, notes, range, when it plays, its texts and — in
+  karaoke files — its lyrics. Tracks whose declared length is wrong are read
+  to their end-of-track event; a file cut short is read up to the cut and
+  says so.
+- **Audio** (MP3, FLAC, OGG, Opus, M4A, WAV, AIFF, WMA, APE, WavPack…), with
+  the `audio` extra (`pip install rtfm-ai[audio]`, plugin:
+  `rtfm-install-extras audio` — mutagen, pure Python): title, artist,
+  album, composer, conductor, genre, date, track, label, BPM, ISRC,
+  comments, lyrics (a passage of their own), and the stream — duration,
+  sample rate, bit depth, channels, bitrate. ID3 tags inside WAV and AIFF
+  are read too. The sound itself is not analysed or transcribed.
+
+`rtfm status` lists the audio extra.
+
+## [0.50.1] — 2026-10-07
+
+0.50.0 was tagged but never published: a new test needed a library the
+test machine does not install. Same content as below.
+
+### Changed — a binary nothing can read is neither indexed nor tracked
+
+A file no parser claims and whose content is binary used to be tracked —
+with an identity at first, then without one. Either way it cost a job every
+time it changed (a small database inside one project was read 240 times a
+day for nothing) and it sat in every check as a file with nothing behind
+it. The scan now leaves it out; one tracked before leaves the index when it
+changes, and every start takes out those recorded earlier (971 across one
+fleet: images, parquet, fonts, compiled libraries, MIDI). Binary formats
+that have a reader — PDF, spreadsheets, ebooks, SQLite — are not concerned.
+Coverage counts these files as skipped, not missing.
+
+### Fixed — the indexer held gigabytes it never gave back
+
+Each embedding job handed all its passages — up to 64 — to the model at
+once, and the model's runtime keeps the working memory of the largest batch
+it has seen. Twelve lanes share the model: the indexer reached 6 GB. The
+model now sees at most 8 passages at a time — about 50 MB per batch instead
+of 400, at the same speed or better.
+
+The memory ceiling that restarts the indexer was multiplied by the number of
+lanes, a leftover from one worker process per project: 18 GB on a 12-lane
+machine, so nothing noticed. It is now one ceiling for the one process
+(5 GB, never above 60 % of RAM).
+
+## [0.49.3] — 2026-10-06
+
+### Fixed — a project taken off the list went on being served
+
+The indexer re-reads its project list only when the list changes, and let go
+of a removed project only if it happened to be idle at that very moment. A
+project busy then was kept for good and served as before, so pausing one
+project took a restart of the whole indexer. A project off the list now gets
+no new work from that moment, and is let go once its jobs in flight finish.
+An unreadable list no longer drops every project either.
+
+## [0.49.2] — 2026-10-06
+
+### Fixed — a scanned book queued whole was read whole, and timed out
+
+A scanned PDF is read in tranches of 50 pages, each with a 30-minute budget.
+When its page count was unknown at the moment it was found, it was queued as
+one job covering the whole book — still under the budget of one tranche —
+and long books failed: eight on one project, never retried. The reader now
+counts the pages first and splits a long book into tranches before reading
+anything. Books that already failed that way are queued again on the next
+start (or by `rtfm repair`), once.
+
+## [0.49.1] — 2026-10-06
+
+### Fixed — text recognition could take every core at once
+
+Recognising the text of a scanned PDF runs a program that uses several
+cores per page, and nothing limited how many ran together: a backlog of 53
+scanned PDFs held eleven lanes at once and took the machine to a load of 33.
+At most two now run at a time across all projects; other work keeps the
+remaining lanes.
+
+## [0.49.0] — 2026-10-06
+
+### Changed — sources are looked at when they change, not every minute
+
+The periodic scan could not know a directory was idle: it listed every file
+of every source every minute, so a project untouched for months cost as much
+as an active one, and one with 48 sources never got past its own scans — 53
+scanned PDFs waited five weeks behind them.
+
+- **Local sources are watched.** On Linux the kernel reports changes; a
+  source is scanned a few seconds after its activity settles, at most every
+  30 seconds, and otherwise once a day in case a notification was lost.
+  What the scan skips — dependencies, version-control stores, agent working
+  copies, what `.gitignore` and `.rtfmignore` exclude — is not watched and
+  triggers nothing.
+- **Network shares are looked at on a slowing clock.** A change made on the
+  other machine is never reported, so these are still scanned, but every
+  scan that finds nothing doubles the wait — one minute up to an hour — and
+  the first one that finds something brings it back to a minute. The same
+  applies to any source that cannot be watched (no inotify, watch budget
+  spent). `RTFM_NO_WATCH=1` turns watching off.
+- Each source keeps its own schedule, timed from the end of its last scan.
+  The project-wide rounds, and the round tracking added in 0.47.3–0.47.4,
+  are gone.
+
+## [0.48.0] — 2026-10-06
+
+### Fixed — a source taken out of the configuration stayed in the index
+
+`rtfm remove`, or editing the configuration, changed what is scanned and
+nothing else: what a retired source had indexed stayed, answering searches
+and duplicating files under an old corpus name. One project kept four
+retired corpora, 597 files of which 359 a second time. Files no declared
+source covers are now taken out when a project opens — so on upgrade, with
+nothing to run — at every hourly reconcile, and by `rtfm repair`. An
+unreadable configuration removes nothing.
+
+## [0.47.4] — 2026-10-06
+
+### Fixed — the pause between scan rounds was timed from the wrong moment
+
+0.47.3 waited for a round to end before starting the next, but counted the
+interval from the last time it looked, not from the end: the next round left
+twelve seconds after the previous one, housekeeping took them, and the
+starved work still never started. The interval now runs from the observed
+end of the round.
+
+## [0.47.3] — 2026-10-06
+
+### Fixed — a project with many sources never ran anything but scans
+
+The periodic scan started a new round every minute, whether or not the last
+round was finished. On a project with 48 source directories a round took six
+minutes, so the queue always held a scan, and a scan goes first: OCR jobs
+waited five weeks and embeddings three, under a backlog of 484 — too small to
+trip the pause that stops scanning above 500. A new round now starts one
+interval after the previous one ends.
+
+## [0.47.2] — 2026-10-06
+
+### Fixed — every scan walked the directories it excludes
+
+The scan listed everything below a project, then dropped what the rules
+exclude: each `.git`, `node_modules` and agent working copy was walked in
+full on every pass. On one project that was 164,043 entries visited for
+7,480 kept, six seconds a pass — and every project is scanned once a minute.
+The scan now never enters an excluded directory. Same files found on every
+local project, a full round three times faster.
+
+## [0.47.1] — 2026-10-06
+
+### Fixed — agents' working copies kept the indexer busy for ten days
+
+Claude Code agents work in full copies of the repository under
+`.claude/worktrees/`, one per agent, deleted when it finishes. Each copy was
+indexed, embedded, then removed, and the next agent started it again: on one
+project 11,064 of a day's 11,111 ingests came from there, and the indexer
+held two cores for ten days on content the index already had under its real
+path. That path is now never indexed, and copies already in an index are
+removed at the next pass. The rest of `.claude` — notes, agent definitions —
+stays indexed, and a `worktrees` directory anywhere else is not touched.
+
+## [0.47.0] — 2026-09-23
+
+### Added — a bibliographic card for an indexed file
+
+Quoting a passage needs what a search result does not carry: who wrote it,
+under what title, and — for a scanned book — between which pages the author's
+own text runs, so a preface by someone else is never attributed to them.
+
+Three sites kept that description in three shapes beside their own corpus,
+and one engine read all three. Lists describing the same corpus drift, and
+the one that drifts is the one nobody looks at, so the description now lives
+next to the index it describes: `rtfm cite <path>` reads one card,
+`rtfm cite --corpus <name>` lists a corpus, `--set` records one and
+`--from` a whole file of them, all with JSON output. `--unknown` reports
+cards naming a file the index does not track, which is how a renamed file
+silently loses its description.
+
+Cards live in a table of their own, keyed by corpus and path, because a
+document's row is deleted and rewritten on every re-index.
+
+There is no permission flag: a card naming an author and a title is
+attributed and may be quoted, one without is background reading. That
+follows from what is recorded, so there is no state to set and none to
+drift.
+
+## [0.46.1] — 2026-09-15
+
+### Fixed — an index could still be created where no index belongs
+
+It happened three times on one machine, each time through a different
+creator, because the rule lived in none of them: a 27 GB index of twenty-six
+already-indexed projects; on 2026-07-29 a home directory and a development
+tree indexed whole, 9.9 GB of duplicates; and on 2026-09-07 the same
+development tree again, from the plugin at the start of a session opened at
+its root.
+
+The rule has one home now, and both creators — `rtfm init` and the plugin's
+session start — ask it first. Refused: the filesystem root, a home directory
+or anything above it, a directory inside an index directory, and a directory
+already holding an indexed project below it. A project that already has its
+own index may be initialised again.
+
+### Added — status and audit say when the plugin is behind
+
+The Claude Code plugin runs its own copy of RTFM, not the installed package.
+On one machine it stayed at 0.39.4 for eight days while the package reached
+0.45.0, and every fix in between reached no agent. `rtfm status` and
+`rtfm audit` now say so, with the command that updates it.
+
+## [0.46.0] — 2026-09-15
+
+### Fixed — the plugin created indexes that nobody ever scanned
+
+The plugin's session-start hook indexes the project a session opens in, and
+its end-of-turn hook indexes what the agent edited. Neither ever enrolled the
+project with the supervisor, so the supervisor never scanned it. A monorepo
+agents moved into on 2026-09-07 was used for eight days and held only the
+files they had happened to edit; the project list had not been written once
+in that time.
+
+Both hooks now enrol the project — registration only, never starting a worker
+from plugin code, which would run whatever version the plugin cache holds.
+Projects already stranded recover at their next session. `rtfm status` says
+plainly when a project is not enrolled, because its queue is never busy and
+the worker block never spoke.
+
+The same hook indexed wherever a session was opened, including the root of a
+development tree already holding thirty indexed projects. It now refuses a
+home directory, anything above one, and a directory that already contains an
+indexed project; `rtfm init` remains for a deliberate choice.
+
+Hook fixes reach Claude Code users when the plugin is updated: the plugin runs
+its own copy of RTFM, not the installed package.
+
+### Fixed — the test suite wrote into the developer's project list
+
+The path to the project list was defined twice, and a test replaced a
+function under a name its command never used — the command imports its own
+copy at call time. The real function ran, enrolled the test's temporary
+directory and made sure the real supervisor was up: thirty-three such
+directories had accumulated. The list now has one module and one path, the
+suite redirects it for every test, and a guard fails if the path is built
+anywhere else.
+
+### Fixed — a refused binary read as a silent loss
+
+The ingest refuses binaries on purpose but recorded them like a text file that
+produced nothing — the exact shape the audit looks for. One project reported
+7 857 such files, of which 7 543 were compiled libraries, CAD drawings and
+scans awaiting OCR; the 314 real losses were buried. A refused binary is now
+recorded with no identity, excluded from the audit and from coverage, and rows
+written the old way are re-marked when a project is opened or by `rtfm repair`.
+
+### Fixed — the archive purge asked every directory but the right one
+
+A file declared unversioned kept its archive whenever the same index gathered
+another directory without that declaration: one index kept 1.7 GB of mailbox
+history its mail directory had declared unwanted. Each file is now judged by
+the rules of the directory it was indexed from.
+
+## [0.45.0] — 2026-09-07
+
+### Fixed — three bad bytes cost a whole document
+
+Markdown was the one format RTFM decoded strictly. A document carrying an
+emoji that had lost its first three bytes failed to decode, and the failure
+took the file with it: 40 KB of good prose, out of the index from the day it
+was written. Nothing recorded it — `ingest_failures` held zero rows — and
+the file was tracked as seen, so nothing would ever retry it.
+
+It cost more than its own absence. It carried a cross-reference that had
+gone dead, and the project's own checks never found it either: a file that
+cannot be read escapes every check that reads files.
+
+Markdown now decodes the way every other parser already did. Indexed
+leniently is not indexed silently: the ingest says how many bytes were not
+valid text, so whoever wonders why a passage reads oddly has something to go
+on.
+
+### Changed — the job record is bounded by count as well as age
+
+Thirty days assumes a steady rate of work, and a busy project has no such
+thing: one index produced 792 135 finished jobs inside the window, so the
+record of the work was the second-largest thing in the database while every
+row in it was legitimately recent. At most 20 000 finished jobs are kept,
+whatever their age. Pending and running rows are the queue itself and are
+never touched.
+
+### Fixed — freeing space did not give it back
+
+Deleting rows hands their space to SQLite, not to the disk: the file keeps
+it for future rows. That is right for a few thousand rows and wrong for what
+housekeeping frees — one index sat at 4.36 GB of which 3.30 GB was space it
+had already released and would never use again, because a rebuild was only
+ever asked for after a purge of orphans. A pass that frees ten thousand rows
+or any stored history now asks for one.
+
+## [0.44.0] — 2026-09-07
+
+### Changed — version history is a read, so agents get it
+
+`rtfm_history` was the only read-only tool held back from the default tool
+profile, alongside the ones that write. An agent could search, expand and
+walk the graph, but not ask what a file used to say — and had no way to know
+the answer existed. It joins the other reads, and takes `project` like them.
+
+### Added — `rtfm gc` clears archives the project no longer wants
+
+Declaring a file under `[versions]` in `.rtfmignore` stops the next copy
+from being made; it cannot undo the ones already stored. The hourly
+reconcile — which `rtfm gc` triggers — now drops the snapshots of files the
+project has declared unversioned. The file, its index entry and its
+searchability are untouched; only the stored copies of its past go.
+
+On the index that prompted the section: six mailboxes holding fifty
+near-identical copies each, two thirds of a 3.2 GB archive standing beside a
+300 MB index.
+
+## [0.43.0] — 2026-09-07
+
+### Fixed — the write-ahead file never gave its space back
+
+Beside one 4.36 GB index sat a 4.37 GB write-ahead file. A checkpoint
+reported three live pages in it: everything else was space long since
+written into the database and never handed back. `journal_size_limit`
+defaults to "no limit", so SQLite keeps the file at whatever high-water mark
+a heavy re-index once pushed it to, for the life of the database. A
+truncating checkpoint reclaimed all of it in a tenth of a second.
+
+Every connection now bounds it at 64 MB, so it cannot happen again, and the
+hourly reconcile truncates a journal already over that bound — which is what
+existing indexes need, their file having grown before the limit existed.
+
+The write-ahead file is not a log and holds no history: after a checkpoint
+its content is already in the database, so there is nothing in it to keep
+for a while. There is only space to give back.
+
+### Changed — a finished job is forgotten after a month
+
+The record of jobs run is worth keeping long enough to answer "what did the
+index do last month", and no longer. One project held 766 000 finished rows,
+640 MB — the second-largest thing in its database — and a failure count that
+still reported a defect fixed four days earlier. A counter that never
+forgets is one nobody reads. `done` and `failed` rows older than thirty days
+are dropped by the hourly reconcile; anything pending or running is the
+queue itself and is never touched, whatever its age.
+
+### Fixed — `rtfm history` took an identity nobody could guess
+
+It accepted a book slug and nothing else. `CLAUDE.md` is filed under
+`default--claude` — a name no one would guess, and one that for files
+indexed before 0.30 does not even carry the extension. So the command
+answered "No version history" while fifty versions of the file sat in the
+index, and a workshop of sixteen repositories concluded that RTFM's version
+history did not work anywhere.
+
+It takes a path now, like every other command that names a file, and the
+rule that turns a path into a document is the one `rtfm_expand` already used
+— moved to one place so the two cannot drift apart. A slug still works.
+
+## [0.42.0] — 2026-09-07
+
+### Added — `.rtfmignore` can say "index this, but keep no history of it"
+
+RTFM keeps a full copy of a file's text every time it changes, capped at
+fifty versions per file. Fifty is right for a source file of a few
+kilobytes and ruinous for a log or a mailbox: measured on one workshop, a
+24 MB mailbox appended to every few minutes held fifty near-identical copies
+of itself — 740 MB for one file — and six such files accounted for two
+thirds of a 3.2 GB archive, against roughly 300 MB for the index itself.
+
+The cap counts versions, not bytes, and nothing inside RTFM can tell an
+appended log from an edited document. The project can. `.rtfmignore` now
+takes section headers: everything above the first one keeps the meaning the
+file has always had — do not index this — and `[versions]` lists what to
+index while keeping no history of it.
+
+```
+dist/
+*.tmp.md
+
+[versions]
+courrier/*.md
+*.log
+```
+
+A file written before sections existed has no header, so all of its lines
+are still indexing rules and it reads exactly as it did. A misspelt header
+is ignored rather than read as a pattern, so a typo cannot silently drop a
+directory from the index.
+
+## [0.41.0] — 2026-09-06
+
+### Added — reaching another project's index by name
+
+RTFM resolves its database from the working directory. That is right for the
+ordinary case and wrong for the one that matters most in a workshop of
+several repositories: the knowledge that binds them together lives in none
+of them. A rule governing sixteen repositories is kept once, somewhere
+shared, and an agent inside one of them could not reach it — its search
+resolved to its own index, the shared one was not in it, and the query came
+back empty. An empty answer reads as "there is no such rule".
+
+Measured on 2026-09-06: an agent asked whether a project rule settled a
+technical question, found nothing, concluded that nothing settled it, and
+came within one step of deciding alone what had been decided a week earlier.
+The rule existed, dated, and prescribed the order of the steps to take.
+
+`rtfm_search`, `rtfm_context`, `rtfm_expand` and `rtfm_books` take a
+`project`: a name (`"hub"`), or a path when two projects share a name — a
+working tree and its published copy do, and they hold different content, so
+that ambiguity is refused rather than guessed. Names come from the registry
+the supervisor already keeps, and an unknown one is answered with the list
+of reachable ones.
+
+A visit is a read. A neighbour's index has its own worker, and a reader that
+queues work into it is a second writer under another name — so drift in a
+visited project is reported, never repaired, and paths are resolved against
+the index the results came from rather than our own.
+
+### Added — `rtfm coverage` and `rtfm_coverage`
+
+Coverage was being measured by hand, as books over files in the tree,
+because nothing authoritative existed. That denominator counts logs, lock
+files, state files and build output the scan never looks at, so a project
+reads as far more full of holes than it is: one repository measured 98.4%
+where its own figure had been showing a fraction of that.
+
+The denominator is now the scan's own list — same walk, same exclusions,
+same configuration. The measure separates the three ways a file can be
+missing: not indexed yet, indexed with nothing readable behind it, and
+tracked under a source no longer configured.
+
+### Fixed — a file deleted before its turn is a removal, not a failure
+
+A scan lists files; a job reads them later. On a repository people are
+working in, some of those files are gone by the time their turn comes, and
+that is the ordinary race, not a fault. It was counted as a failed job.
+Measured on a repository that deleted 420 documents in a day: every one of
+the resulting failures described a file its author had meant to delete, and
+a failure count full of non-events is one nobody reads.
+
+The file is now taken out of the index and the job completes. A file is only
+believed gone when the directory that held it is readable — an unmounted
+volume makes everything under it look deleted, and emptying an index on that
+evidence is the one outcome worse than a noisy counter.
+
+### Changed — a search no longer offers content that is not there
+
+A result whose file has been deleted used to come back labelled, which
+leaves the reading to the agent. On a repository that had just condensed 338
+documents into one, eleven of twelve results named files that no longer
+existed, the one surviving authority ranked below them, and the agent
+concluded that nothing decided the question. Those results are now withheld
+and their removal queued, under the same rule about unreachable directories.
+
+## [0.40.0] — 2026-09-06
+
+### Added — an index repairs itself on upgrade
+
+Fixing the code that wrote a bad record does nothing for the files already
+carrying it. A scan acts on the difference between disk and what it recorded
+last time, so a record that is wrong but *stable* produces no difference and
+is never revisited. Every fix to how a file is recorded therefore has a
+second half that had no home until now.
+
+`rtfm repair` is that second half, and the supervisor runs the same pass on
+every project it opens — which is the moment every upgrade passes through,
+whoever started RTFM and whether or not anyone reads a log. It is safe on
+every start: it finds nothing on an index already repaired, and nothing on
+one that was never affected. A repair that fails never keeps a project from
+being served.
+
+The first pass it carries: files that share an identity, where only the last
+one indexed is readable. Identities used to stop at the first dot, so
+`-se.Alan` and `-se.Alarm` both became `-se`. That was fixed in 0.30, but an
+identity is never recomputed for a path already tracked — the rule that keeps
+a working index stable across upgrades — so every file indexed before the fix
+kept its colliding one. Measured on a fleet weeks after the fix had shipped:
+910 files across two projects, in groups of up to 126 files readable as a
+single document. The repair clears their tracking; the next scan indexes each
+of them separately.
+
+### Added — `rtfm status` names what the index cannot be right about
+
+The audit checks existed and nobody ran them. They now print at the foot of
+`status`, with the two commands that act on them — the one command an agent
+does run when it wants to know where it stands, and so the place a silent
+defect has to become visible.
+
+## [0.39.6] — 2026-09-06
+
+### Added — the audit now looks in the other direction
+
+Every check asked the same question: is there an entry in the catalogue that
+nothing accounts for? That finds a catalogue with too much in it. It cannot
+find the opposite — a file the scan has seen, recorded and marked up to date,
+with nothing readable behind it — and the opposite is what the two worst
+defects this index has had both looked like. Nothing errors, the counts stay
+plausible, and the tracking says the work is done, so nothing ever retries; a
+search returns no result and the agent concludes the subject does not exist.
+
+`mute-files` reports tracked files with no catalogue entry, excluding those
+that carry no text by nature (images, fonts, audio, archives, binaries) and
+empty ones. It is the check that would have named the 5 738 HTML files fixed
+in 0.39.3 the day they went missing, instead of weeks later.
+
+`shared-identities` reports files that answer to the same identity, where
+only the last one indexed is readable. Identities used to stop at the first
+dot, so `-se.Alan` and `-se.Alarm` collapsed onto `-se`; that was fixed, but
+an identity is never recomputed for a path already tracked, so files indexed
+before the fix keep the colliding one. Measured on the fleet after the fix
+had shipped: 502 files in one project and 408 in another, in groups of up to
+126 files readable as a single document.
+
+Both run under `rtfm audit` and in the supervisor's hourly pass.
+
+## [0.39.5] — 2026-09-06
+
+### Fixed — a connection that went read-only never came back
+
+SQLite decides whether a database is writable once, when it opens the file,
+and never revisits that decision. A publication that holds its directory
+read-only for a second while it swaps content is enough: whatever opened the
+database in that second keeps a read-only handle for the life of the process.
+
+The supervisor opens each project's database once and holds it. So a project
+published while the supervisor happened to be connecting became permanently
+unservable — every attempt to take a job from its queue failed with `attempt
+to write a readonly database`, and the dispatcher, which retries several times
+a second and logs every attempt, produced 33 707 identical lines in eighty
+minutes across six projects. The database itself was fine the whole time: a
+plain write to it from a shell succeeded.
+
+The connection is now reopened when the error says the *handle* is dead
+(read-only, cannot open, I/O error) rather than that the *file* is corrupt,
+and a project whose queue keeps failing is set aside for a doubling delay up
+to five minutes instead of being re-picked on every pass. The log says it once
+per run of failures, not once per attempt.
+
+### Fixed — enrolling two projects at once lost one of them
+
+A project joins the fleet by reading the enrolment list, appending itself and
+writing the whole list back. Nothing synchronised that, so two enrolments that
+overlapped ended with the second one's list — which does not contain the first
+one's project. That project keeps its database, its queue and its scan root,
+and is never looked at again; nothing anywhere says so.
+
+Measured on a fleet publishing sixteen repositories in parallel: eight
+projects enrolled and absent from the list, one of them a repository created
+that morning whose index stayed at its nine initial files. A reproduction
+without the fix loses 21 of 24 simultaneous enrolments.
+
+The read-modify-write now holds a lock, and the list is written to a sibling
+and renamed so a reader can never catch it half-written. A caller that cannot
+take the lock within a second gives up rather than block a save; the next
+command retries.
+
+## [0.39.4] — 2026-09-05
+
+### Fixed — `reindex` read the catalogue, so it could not repair the catalogue
+
+The repair path for 0.39.3 did not work. `rtfm reindex` selects the files to
+re-ingest from `books` — but a book deleted by the reconcile pass leaves only
+its tracking row behind, and that is precisely the state a re-ingest exists to
+fix. It answered "no matching indexed files" for all 5 738 HTML documents the
+fleet had lost that way.
+
+It now reads `indexed_files`, which is the authority on what is indexed at a
+path, and whose `filepath` is a relative path by definition —
+`books.filename` is not reliably one, holding a bare basename in some
+projects, which the root lookup then failed to resolve.
+
+## [0.39.3] — 2026-09-05
+
+### Fixed — an HTML document's `<title>` was used as its identity
+
+Found by the fleet audit: six books in one catalogue that no scan tracked.
+The HTML parser recomputed the slug from the document's `<title>`, ignoring
+the one the ingest handler had already allocated — so the catalogue entry
+carried a title-derived identity while the file tracking carried the
+path-derived one. The two never matched, and every HTML document read as an
+untracked book for ever.
+
+The sharper consequence is collision. Two pages sharing a `<title>` —
+ordinary in a docs tree, a set of mockups, a generated site — collapsed onto
+one identity, and the second was refused. Every other parser already took the
+caller's identity and fell back to the path; this one alone recomputed.
+
+A parser proposes a *title*. What a document is called is not who it is. The
+title is still read from the document and is still the book's title; the
+fallback for a direct `Library.ingest(path)` is now path-derived, like
+everywhere else.
+
+**Correction to this entry, written after measuring the fleet:** the
+consequence above understates it. The reconcile pass drops books no scan
+tracks, and a title-derived book is by definition untracked — so every HTML
+document was indexed, then deleted on the next reconcile, while its file
+stayed marked as indexed and was therefore never read again. HTML content was
+not merely mis-identified; it was **absent from the index**, silently, in
+every project. Measured before the repair: 5 738 documents across 21 indexes,
+including one corpus tracking 5 463 HTML files with zero of them in the
+catalogue. See 0.39.4 for the repair.
+
+## [0.39.2] — 2026-09-05
+
+### Fixed — the removal was queued, then refused
+
+0.39.1 got an excluded path onto the removal list. It got no further: the
+remove handler takes its own last look at the disk before destroying chunks
+and their embeddings, and refused every one of them — `still on disk, kept`,
+on every pass, exactly as before. Two guards, and fixing one moved nothing.
+
+That last look is right for an ordinary file: a queue can be days behind, and
+one stat is the difference between a stale index and a destroyed one. It is
+wrong for a path the rules exclude, where presence proves nothing. The handler
+now applies the same distinction the scan does, and says which rule it acted
+on.
+
+## [0.39.1] — 2026-09-05
+
+### Fixed — a newly excluded path never left the index
+
+The other half of 0.39.0's exclusions, and it applies to every rule RTFM has
+ever added. The scan stops offering an excluded file, so it lands in the
+removal list — and there the disk check holds it back, because the file is
+still perfectly present. The entry then stays indexed for ever: excluding
+something only ever stopped it being re-read, never got it out.
+
+An exclusion is a decision, not an absence, so the disk has no say. A path
+the built-in rules exclude is now removed whether or not it is still there.
+Only the built-in rules — an excluded directory, a transient sidecar. Not
+`.gitignore`/`.rtfmignore`, which the user edits and which an unreachable
+mount can make unreadable: the guard that stands between a dark mount and
+deleting real content is untouched.
+
+## [0.39.0] — 2026-09-05
+
+Both findings come from `rtfm audit` on a 55-index fleet — the two checks
+that survived after 0.38.2 left it at six findings.
+
+### Fixed — losing a race for an identity dropped the file for good
+
+Two paths can always normalise to the same slug; `allocate_book_slug` exists
+for exactly that and appends a counter. But it reads, then writes, and a
+project's documents are ingested several at a time — so two files can both be
+told the slug is free, and the second insert violates the unique index.
+
+That was recorded as a *content* failure, and the failure record keys on the
+file's **hash**: the file was never offered to the indexer again. Two
+documents on the reporting fleet had been out of the index for good, findable
+only in an audit line. Both were real content, sitting next to a sibling whose
+name differed only by punctuation the slug rule collapses (`-wg.dhin.txt` and
+`-wg.dhin--.txt`).
+
+By the time the violation is raised the winner has committed, so asking again
+yields an identity nobody holds. The ingest now retries once, for this exact
+violation and no other, and logs the identity it settled on. Any other
+`IntegrityError` still propagates untouched — a retry loop around all of them
+would hide real corruption.
+
+### Fixed — transient database sidecars were indexed as documents
+
+A SQLite write-ahead log and its shared-memory index exist only while a
+database is open, hold no text, and appear and vanish under the scan. The
+audit's churn check found one indexed nine times and removed three times in a
+single day, on three separate projects. Files ending `-wal`, `-shm` and
+`-journal` are now never scanned; the database file itself still is.
+
+`.codegraph/` joins `.rtfm/` in the always-excluded directories, for the same
+reason `.rtfm/` is there: it is another tool's index of the very repository
+being scanned, so indexing it re-ingests the project's own content in a binary
+form nothing reads back.
+
+## [0.38.2] — 2026-09-05
+
+### Added — `.mjs`, `.cjs`, `.mts`, `.cts`
+
+`.js` was indexed and `.mjs` was refused with "No parser available". Nothing
+chose that: the extension list simply predates the module suffixes. Reported
+by a repository whose tooling is written as ESM — eleven files rejected while
+their `.js` neighbours went in fine. Same language, same parser; the
+CommonJS and TypeScript spellings are added alongside for the same reason.
+
+## [0.38.1] — 2026-09-05
+
+### Fixed — "I could not read it" is not "it is corrupt"
+
+Found in the supervisor log of the fleet from 0.38.0, while checking that
+release had taken. Two published mirrors were declared corrupt at boot and
+the guard tried to rename their indexes aside:
+
+```
+BPscript: open failed: [Errno 30] Read-only file system:
+  '.../library.db' -> '.../library.db.corrupt-20260904-214926'
+```
+
+Neither index was corrupt. Their directory was read-only for the duration of
+a publication, `check_integrity` opened the database **read-write**, and every
+failure to open was read as corruption. The rename failing — for the same
+read-only reason — is the only thing that saved them. On a writable directory
+the same misdiagnosis renames a healthy index away and re-indexes the project
+from nothing; a database merely held busy by another writer raises the same
+class of error and would earn the same verdict.
+
+The check now opens read-only, so it never needs write access to what it
+checks, and it separates the two cases SQLite already distinguishes:
+`OperationalError` (locked, read-only, unopenable) means *unknown* and
+quarantines nothing — the caller's own open then fails loudly and honestly if
+the condition persists. `DatabaseError` ("malformed", "file is not a
+database") still means corrupt, and still quarantines: the crash-loop that
+guard exists to stop is unaffected.
+
+## [0.38.0] — 2026-09-04
+
+### Fixed — a re-created index left the worker writing to a file with no name
+
+Reported from a fleet of sixteen agents, each confined to its own repository
+and reading its neighbours through RTFM alone. Every repository republishes a
+copy of itself into a shared directory, and each publication re-creates the
+copy's index. Fourteen of the fifteen published indexes sat frozen at exactly
+**two** indexed documents — the two prose files at the repository root —
+while 7 110 jobs waited in their queues and 193 unlinked file descriptors
+stayed open in the supervisor. No log carried an error. The scan line printed
+every minute throughout.
+
+Unlinking a file does not close it. A connection opened before the
+replacement keeps reading and writing the old inode, which no longer has a
+name; a connection opened afterwards, by path, gets the new file. The
+supervisor holds its queue connection for its whole life and the handlers
+open theirs per job — so the two halves ended up on different files and
+stayed there: the scan handler wrote its findings into the live file, the
+dispatcher looked for work in the dead one, found only the periodic scans it
+had queued there itself, and never took a single ingest job.
+
+Self-sustaining, and silent in both directions. Worse than a stall: the index
+still answered, from the two documents it had, with a relevance score and no
+indication that the code had never been read.
+
+* The supervisor now compares each project's database against the file on
+  disk by device and inode, and reconnects when they differ — logging it in
+  both the project log and the fleet log. Only idle projects are swapped: a
+  claimed job owes its closing write to the queue it was claimed from.
+* The MCP server re-validates its handle on every call, for the same reason.
+  A session outlives the index it reads, and serving a neighbour from a
+  snapshot nobody else can see is the worst of these failures — it looks like
+  an answer.
+
+### Added — an index on a read-only mount can be searched
+
+`PRAGMA journal_mode = WAL` is a write: it rewrites the database header.
+Running it unconditionally meant that merely *searching* an index published
+read-only died with `unable to open database file` — so the natural way to
+share one index with several processes did not work, and callers were copying
+the database somewhere writable first.
+
+A library with no write access to its file or its directory now opens
+read-only and skips schema creation and migration. Writes still raise; nothing
+is accepted and discarded.
+
+## [0.37.2] — 2026-09-03
+
+### Fixed — nothing RTFM starts opens a window any more
+
+On Windows every spawn flashed a console, and 32 orphaned `conhost.exe`
+processes were left behind over one session (issue #9, @AVeryTastyRaspberry).
+
+The report blamed the supervisor's own creation flags and proposed adding
+`CREATE_NO_WINDOW` to them. `CreateProcess` documents that flag as *ignored*
+when it accompanies `DETACHED_PROCESS`, so that change would have done
+nothing — but the symptom was real, and the cause was one level down and
+worse than the report assumed.
+
+Detached means the supervisor has **no console at all**. A console program
+started by a parent that has none is given a brand new console by Windows,
+window and `conhost.exe` and all. The supervisor spawns a child interpreter
+for every PDF it reads, to keep pdfium's crashes out of its thread pool. So
+the flashes were not one per `worker start` — they were one per document, and
+on a PDF corpus that is thousands.
+
+Two rules now, and a test that fails if any future spawn forgets both:
+
+* a detached background process runs under `pythonw.exe`, the windowed build
+  of the same interpreter, which never gets a console in the first place;
+* a short-lived helper — the pdfium child, marker, `djvutxt` — carries
+  `CREATE_NO_WINDOW`, where the flag is not ignored because nothing detaches
+  it.
+
+## [0.37.1] — 2026-09-03
+
+### Fixed — three things a real Windows machine found
+
+0.37.0 was confirmed working on Windows 11 by the reporter of issue #8 — the
+lock, a stale lock file, and the graceful drain, each checked against
+`tasklist` rather than against RTFM's own claims. Three defects came back
+with the confirmation, and none of them was about locking.
+
+**`rtfm status` died half-way through its own output.** A redirected stream
+on Windows falls back to the legacy code page, which cannot encode the marks
+in the "optional extras" table, so the command meant to demonstrate the fix
+raised `UnicodeEncodeError` mid-table. The CLI now asks for UTF-8 when the
+stream it was given cannot carry what every command prints, with
+`errors="replace"` underneath so no output can ever end a run. UTF-8 rather
+than a replacement character because a replacement would collapse the
+installed and missing marks into one glyph and turn that table into a lie.
+
+**`worker status` reported a supervisor running after the process was gone.**
+Liveness comes from the lock, and on Unix the kernel drops a `flock` the
+instant its holder dies. Windows releases a byte-range lock at process exit
+too, but not synchronously — how long it takes "depends upon available system
+resources" — so for a few seconds a supervisor that had genuinely exited
+still looked like the lock holder. A held lock whose stamped PID is not alive
+now reads as free.
+
+**`rtfm sync` indexed nothing and called it "nothing to do".** The reporter
+had worked around the original bug by indexing inside a Linux container, so
+every configured source path was the container's. On the host they all
+skipped, and the command exited 0. A configured directory that is not on disk
+is now named on its own line; if none of them exists, `sync` says so and
+exits non-zero instead of reporting success. `rtfm sources` marks them too.
+
+## [0.37.0] — 2026-09-03
+
+### Changed — a stop is asked for, not signalled
+
+Each in-flight job holds the only write connection to its project's
+database, so "stop" has to mean *finish what you are holding, then exit*.
+`SIGTERM` carried that on Unix and could not carry it anywhere else: on
+Windows every signal but the two console events goes straight to
+`TerminateProcess`, so `rtfm worker stop` halted the supervisor where it
+stood — mid-write, the one thing the single-writer design exists to prevent
+(the limitation 0.36.0 shipped with and documented).
+
+`rtfm worker stop` and `restart-all` now leave a request in
+`~/.rtfm/supervisor.stop` naming the supervisor it is for. The supervisor
+looks for it twice a second, including part-way through an idle sleep, and
+on seeing it consumes it, finishes its in-flight jobs and exits without
+respawning. One mechanism on every platform instead of one that worked and
+one that lied; nothing sends a named signal any more, and a test enforces
+that. The hard kill stays as the last resort after eight seconds, for a
+supervisor wedged in a syscall that reads nothing.
+
+The request naming its target is what makes it safe: a supervisor acts only
+on a request aimed at itself, and any request left on disk is cleared as the
+next supervisor takes the lock — before it stamps the PID that makes it
+addressable. Anywhere later in startup and a `worker stop` issued in that
+window would have been swallowed instead of obeyed; that window was real and
+a test now holds it shut.
+
+## [0.36.0] — 2026-09-03
+
+### Fixed — every command was broken on native Windows
+
+`rtfm/core/supervisor.py` imported `fcntl` at the top level, and the CLI
+imports the worker module for every invocation. So on native Windows every
+command — `rtfm --help` included — died inside the import machinery before a
+single argument was parsed, and there was no way to index anything at all.
+Reported in detail by @AVeryTastyRaspberry (issue #8), who also established
+that the MCP server itself was unaffected.
+
+The import was the visible half. Four more calls behind it were Unix-only or
+meant something else entirely on Windows:
+
+* `os.pread`, used to read the supervisor's PID, does not exist there.
+* `os.kill(pid, 0)` — the liveness probe — does not probe on Windows: it
+  calls `TerminateProcess`. Asking "is the supervisor alive?" would have
+  killed it, and killed whatever process had recycled that PID.
+* `signal.SIGKILL` is not defined, so the last-resort kill in `restart-all`
+  raised `AttributeError` instead of killing anything.
+* `start_new_session` is accepted and silently ignored, so the supervisor
+  would have died with the console that spawned it.
+
+All of them now live in one module, `rtfm.core.portable`, with a test that
+fails if any of them is reached for anywhere else — that is how one guarded
+import turns into five unguarded ones. The two copies of the liveness probe
+are down to one. The single-supervisor lock keeps its Unix behaviour and file
+format exactly, and gains a Windows implementation on a reserved byte, since
+a byte-range lock there would refuse a reader the bytes it holds.
+
+Not fixed, and not pretended otherwise: on Windows there is no graceful stop.
+Every signal but the two console events is a `TerminateProcess`, so `worker
+stop` halts the supervisor where it stands. Nothing important is lost — the
+journal makes an interrupted write recoverable — but a cooperative stop would
+have to ask the supervisor rather than signal it.
+
+The Windows code paths are written against the platform's documented
+behaviour and covered by tests for everything a Linux machine can observe,
+including a reproduction of the reported crash. The Windows kernel calls
+themselves are still unverified on Windows.
+
+## [0.35.7] — 2026-09-03
+
+### Fixed — 0.35.6 never reached PyPI
+
+Its test suite imported numpy at module level, and the release runner
+installs no embeddings extra. The embedding-race tests now skip without
+numpy. No change to the engine.
+
+## [0.35.6] — 2026-09-03
+
+### Fixed — the disk and the index may change under a running job
+
+Two races, both harmless in substance, both failing whole jobs:
+
+* A scan lists a directory, then reads each file. A file that disappears
+  in between — an editor's atomic save, a build's temporary — took the
+  entire scan down with a "no such file" error. It is now treated as what it
+  is: absent, with the removal path checking the disk once more before
+  acting.
+* An embedding job reads its passages, spends seconds in the model, then
+  writes. When the same file was re-indexed in those seconds, every passage
+  had been replaced and the write failed on a foreign key — 28 failed jobs
+  in one night, for embeddings nobody needed since the new passages carry
+  their own job. The existence test now rides inside the write itself.
+
+## [0.35.5] — 2026-09-02
+
+### Fixed — the orphan check no longer takes minutes
+
+The check that every catalogue entry is tracked by a scan was written as a
+correlated subquery, which re-reads the whole tracking table once per entry:
+195 seconds on a 26 000-document index, and the supervisor ran it every hour
+on a thread sharing the machine with the indexing. `rtfm audit` took three
+minutes on a fleet whose every other check finishes in under four seconds.
+
+The tracked identities are now gathered once and each entry looked up among
+them — 0.13 seconds on the same index. The reconciliation pass had used that
+form since 0.35.0; the audit simply never caught up.
+
+## [0.35.4] — 2026-09-01
+
+### Fixed — a duplicate is not a document that lost its tracking
+
+The repair in 0.35.0 indexed an untracked file without attaching it, so the
+file was given a *second* identity and the first stayed orphaned. 748 entries
+on one project were two entries for one file, and each repair pass simply made
+another one.
+
+An untracked entry whose path is already tracked under another identity is now
+recognised for what it is — a leftover that only duplicates the live one's
+answers — and dropped. Reconciliation settles the whole set in a single pass.
+
+## [0.35.3] — 2026-09-01
+
+### Fixed — re-attaching a document actually attaches it
+
+0.35.0 repaired a document nothing followed by queueing an indexing job for
+it. That was not enough: an untracked file is given a *fresh* identity when it
+is indexed, so the job created a second document and left the first orphaned
+exactly as before. 748 came back on the next audit having been "repaired".
+
+The tracking row is written on the spot now, pointing at the identity the
+document already has, with an empty hash so its content is re-read even if the
+queued job is lost.
+
+## [0.35.2] — 2026-08-31
+
+### Fixed — a real one-page paper is not a pagination fault
+
+"One page, several passages" swept up every genuine one-page document: they
+split into two or three passages and are perfectly indexed. `backfill-pages`
+re-ingested them on every run and the audit reported them for ever.
+
+The signature is physical instead. One page holds about 3 000 characters —
+the median across 1 388 correctly-paginated PDFs here — so a single page
+credited with more than 20 000 is a whole book flattened onto page 1, which is
+exactly what extraction did before 0.30.0. Real one-page papers, at 2 000 to
+7 000 characters, are left alone.
+
+## [0.35.1] — 2026-08-31
+
+### Fixed — a corpus that no longer exists still gets settled
+
+Renaming a corpus in the config leaves its old name behind with no source
+directory, and 0.35.0 filed those entries under "cannot decide" — 871 of them
+on one project, left exactly as they were. They are not undecidable: the file
+is somewhere the project knows, or nowhere. Every recorded directory is
+searched before concluding.
+
+### Fixed — an impossible path is not an unreadable one
+
+One index held two entries whose "filename" was a queue payload — 591
+characters of JSON, written by something that put a queue row into the
+catalogue. Asking the disk about a name that long raises, and reading that as
+"this location cannot be read" would have protected the corruption for ever.
+Errors that mean *no such file could exist here* now count as absence; only a
+genuine read failure holds an entry back.
+
+## [0.35.0] — 2026-08-31
+
+### Fixed — the catalogue and the disk are made to agree
+
+Indexing writes a document and its passages first, then the tracking row that
+says "this file is indexed". A worker that dies between the two leaves a
+document nothing follows: never refreshed, never removed, still answering
+searches with content that may have left the disk months ago. This worker died
+often — pdfium segfaults, memory kills, several supervisor restarts a night —
+and **6 283 such documents** had piled up across this fleet, 5 772 on one
+project.
+
+Reconciliation now settles each one against the disk and nothing else: the
+file is there and the document is re-indexed properly, or the file is gone and
+the document goes with it, passages included. A corpus whose source
+directories are unknown is left alone and reported rather than guessed at, and
+an unreadable mount is never taken as proof that a file is gone.
+
+### Fixed — a passage with no text is never stored
+
+Search could match a document and then hand the reader nothing. The HTML
+parser produced these on markup containing no text. They are refused at the
+door now, and reconciliation purges the ones already stored.
+
+## [0.34.1] — 2026-08-31
+
+### Fixed — the churn check tells a busy file from a loop
+
+Flagging any file re-indexed a dozen times a day meant flagging every journal
+an agent appends to — real activity, reported as a defect. A check nobody
+reads for long is how a watchdog stops working.
+
+Two signals separate the cases. A file being edited is only ever *indexed*; a
+file caught between two scans is indexed **and removed**, over and over, and
+nothing else produces that. Sheer volume still counts on its own — the
+cross-corpus theft produced no removals at all, only 82 000 passes over one
+README — but the bar is now a hundred a day rather than a dozen.
+
+## [0.34.0] — 2026-08-31
+
+### Fixed — scanning no longer starves the work it finds
+
+A scan holds its project's slot alone. On a project with 26 source
+directories a full round takes minutes — and the round was re-enqueued every
+60 seconds, at a priority above indexing and embedding. Nothing else ever ran:
+one project sat at 81 000 pending embeddings, 1 743 pending files and 174
+pending removals for a whole day, scanning without pause and finding nothing
+each time. The queue looked busy and was doing no work at all.
+
+Periodic scanning exists to *discover* work. Past 500 jobs already discovered
+and waiting, it pauses and says so, and resumes when the backlog clears. A
+scan you asked for — `rtfm sync`, the edit hook — is a different path and is
+never paused.
+
+## [0.33.0] — 2026-08-31
+
+Both of these were found by looking at a project that had stopped moving —
+81 000 embeddings pending and none completing for hours — and both were
+introduced the night before, by the fixes in 0.30.0 and 0.32.0.
+
+### Fixed — a scan compares itself to its own directory
+
+Which directory a stored path is relative to was never recorded, so a scan of
+one directory of a multi-directory corpus saw every *other* directory's files
+as missing, and had to stat each one against every sibling to learn otherwise.
+On a corpus of 478 such files spread over five directories on a network mount,
+that ran on every scan. The scans stopped fitting in their interval, took the
+project's exclusive slot permanently, and everything queued behind them —
+indexing, removals, 81 000 embeddings — never ran at all.
+
+`indexed_files` now records the source directory each path came from. A scan
+claims what it found in one write and compares itself only to that, so a
+sibling directory's files are not candidates for removal in the first place.
+Existing rows are claimed by the first scan that finds them; the per-file
+check that stood between a glitch and a deletion stays as a last resort, with
+almost nothing left to check.
+
+### Fixed — the watchdog no longer stops the work it watches
+
+The hourly self-audit added in 0.32.0 ran on the dispatcher thread. Read-only
+and cheap on a healthy index is not instant on a queue holding three million
+rows: it blocked scheduling for a full half-minute every hour, with no project
+served meanwhile — `STALL: scheduling blocked in 'audit' for 34s`, once an
+hour, all night. It runs on its own thread now.
+
+## [0.32.0] — 2026-08-30
+
+### Added — RTFM checks itself
+
+Every serious defect this index has had passed the whole test suite and was
+plain in the data: a README re-ingested 82 000 times, 1 750 files that never
+entered any index, a corpus of PDFs searchable but unreadable. Each ran for
+weeks, and each was found the same way — by someone noticing a symptom and
+then querying live databases by hand. The suite could not see any of them: it
+tests one project, one directory, one pass, and these needed several projects
+over time.
+
+`rtfm audit` closes that gap. It checks every registered index against the
+properties a healthy one holds, and names what fails:
+
+- **churn** — a file re-indexed a dozen times in a day is two scans undoing
+  each other, not work;
+- **silent drops** — files RTFM refuses to index are remembered so scans stop
+  offering them, which also means nobody is told;
+- **unreadable** — passages that search can find and nothing can display;
+- **pagination** — a document split into many passages cannot be one page;
+- **stranded** — claims nobody will ever close;
+- **orphan books** — catalogue entries no scan tracks, never refreshed, never
+  removed, still answering searches;
+- **untracked roots** — a configured directory the index has never recorded.
+
+The checks are SQL over the queue and the catalogue, so they cost
+milliseconds. The supervisor runs the same ones hourly and writes findings
+into each project's log; `rtfm audit` runs them on demand (`--here` for the
+current project) and exits non-zero when something fires, so a scheduled run
+is noticed without anyone reading it.
+
+### Changed — `rtfm audit` found a seventh thing on its first run
+
+6 283 books across this fleet are tracked by no scan. They are never
+refreshed and never removed, and they keep answering searches with content
+that may have left the disk long ago. Reported, not yet repaired.
+
+## [0.31.1] — 2026-08-30
+
+### Fixed — retrying a failure also forgets it
+
+A failure is remembered twice: as a queue row, and as "this content does not
+parse" so scans stop re-proposing the file. That second memory is right while
+the reason persists and wrong the moment the reason is fixed in RTFM itself —
+`rtfm queue retry-failed` cleared the row and the file still never came back.
+It now clears both, and says how many files the next scan will offer again.
+
+## [0.31.0] — 2026-08-30
+
+### Fixed — two files with the same name are two files
+
+A file's identity was built from its *stem*, which drops everything after the
+last dot. `timed_events.h` and `timed_events.c` became one identity. So did
+`+sc.Ruwet` and `+sc.tryMe`, where the stem stops at the first dot and leaves
+both called `+sc`. Whichever arrived second hit a UNIQUE violation and never
+entered the index — silently, with no error anywhere a person would look.
+**1 750 files across this fleet were missing for that reason.**
+
+The identity now comes from the file name, extension included, and the write
+side refuses to hand one identity to two files even if a future naming rule
+collides again — the second file gets a free one instead of being dropped.
+
+A file that has not moved keeps the identity it was indexed under, so the
+change costs no re-indexing and no embeddings: only files that were never
+indexable get a new one. (One test turned out to depend on the collision: it
+wrote `notes.md` and read back the history of `notes.py`.)
+
+## [0.30.1] — 2026-08-30
+
+### Fixed — one last look before a removal destroys anything
+
+A removal job carries out a decision the scan made earlier, and a queue runs
+minutes or days behind. Deploying 0.30.0 showed the consequence directly: jobs
+queued by the buggy scan were still sitting in queues, each one ready to
+destroy the chunks and embeddings of a file that is on disk right now. The
+handler now re-checks the file's own directories immediately before deleting,
+and keeps anything still present or unreadable.
+
+## [0.30.0] — 2026-08-30
+
+### Fixed — the indexer no longer fights itself
+
+Two directories in one corpus, or the same file in two corpora, put the
+indexer in a loop that never ended. Both are ordinary configurations — `rtfm
+add` accepts them and real projects use them — and both came down to a name
+being treated as if it identified a file on its own.
+
+* **`sync_roots` was keyed on the corpus**, so a corpus gathering several
+  directories kept only the last one scanned. Nothing then knew where the
+  other directories' files lived, and every scan of one directory saw the
+  others' files as deleted. It removed them; the next scan re-indexed them.
+  One project here reached **515 000 removal jobs**.
+* **`indexed_files.filepath` was globally UNIQUE**, so the same relative path
+  in two corpora fought over a single row — each scan claiming the file from
+  the other corpus and the next claiming it back. **932 000 re-ingestions**
+  on that same project, 82 000 of them for one README.
+* **A cross-corpus move fired on matching content alone**, with no check that
+  the file had actually left. The same document genuinely living in two
+  indexed trees is common, and it was read as a move every single pass.
+
+Both keys are widened on open — existing databases keep every row — a scan
+now protects the other directories of its corpus from removal, and a
+cross-corpus move requires the old location to be genuinely gone. This is
+what had the daemon holding three cores around the clock.
+
+Removal also got stricter: a file is deleted only when *every* directory of
+its corpus could be read and none of them holds it. One dark mount now holds
+the removal back instead of counting as proof of absence.
+
+### Fixed — a PDF's text can finally be read
+
+`rtfm_expand` served `[file not available — no path or line info]` for every
+PDF. It read the source file to keep line numbers honest, and a PDF has no
+lines — so search named the right document and then nothing could be read out
+of it. The text was in the index the whole time, which is how search found it.
+Passages from formats that have no lines are now served as indexed.
+
+### Fixed — PDF pages are real pages again
+
+Extraction used pdftext's plain output, which returns the whole document as
+one string with no reliable page separator. Every PDF came back as a single
+page: 45 passages all labelled "Page 1", 118 of 119 documents recorded with a
+page count of 1, and no landmark to navigate a 400-page book by. The
+paginated output gives one string per page, and an empty page no longer
+shifts the numbering of the ones after it.
+
+`rtfm backfill-pages` only looked for a *missing* page count, so it reported
+"0 missing" while 118 files were wrong. It now also picks up a document split
+into several passages that all claim to be on page one.
+
+### Fixed — a dead supervisor says what is waiting
+
+`rtfm worker status` answered "supervisor not running" and stopped there,
+leaving whoever noticed the index had stopped moving to connect the two facts
+themselves. It now names how many jobs are stranded, in how many projects.
+
+## [0.29.0] — 2026-08-30
+
+### Fixed — PDF work no longer runs in the daemon's own process
+
+pdfium keeps process-global, unsynchronised state. The supervisor runs twelve
+lanes in one process, so twelve documents were being opened and paged through
+at once, in the same address space. The library does not survive that: healthy
+files came back as `Failed to load document (PDFium: Data format error)`, and
+often enough the process **segfaulted** — which is not catchable. The whole
+supervisor died mid-flight, leaving every claim its lanes were holding stuck in
+`running` forever. On the reporting project, all ~122 PDFs failed this way and
+none could ever be indexed.
+
+The files were fine: each one extracted perfectly when opened on its own. It was
+the concurrency, and it is reproducible in twenty lines — twelve threads over a
+dozen sound PDFs fail; the same dozen read one after another do not.
+
+Every document now goes through a one-shot child process (the shape the marker
+backend has used since 0.9.5): its own address space, its own pdfium globals,
+and a crash costs exactly one file with a message that names the signal. Text
+extraction, document metadata and tesseract OCR all take that route; the single
+in-process caller left, `rtfm doctor`'s text-density probe, holds a lock. A
+guard test fails if any module starts calling the in-process bodies directly.
+
+### Fixed — a selection rule typed by hand means what it looks like it means
+
+`"exclude": "data/*,build/*"` in `.rtfm/config.json` — exactly what the
+command-line flag takes — was read character by character: `d`, `a`, `t`, `a`,
+`/`, `*`. The scan then selected nothing, silently. The only visible trace was
+`rtfm sources` printing the rule one letter per line. A comma-separated string
+is now read as the list of patterns it obviously is, wherever it appears.
+
+### Added — `rtfm add --no-gitignore`
+
+A corpus of heavy files is routinely kept out of version control, which made it
+invisible to indexing with no documented way through: the option existed on
+`rtfm sync` only, and persisting it meant hand-editing `config.json` after
+finding the key in the supervisor's source. It is now an option on `add`, and
+recorded on the source so every later scan honours it.
+
+## [0.28.3] — 2026-08-29
+
+### Fixed — the server no longer conjures an index where none was asked for
+
+The plugin points `RTFM_DB` at the **relative** `.rtfm/library.db`, so opening a
+session in any directory aimed the server at a database in *that* directory —
+and opening a SQLite database creates it. A session opened once in a parent
+directory was enough: an index appeared, the periodic scan found 151 416 files
+under it (twenty-six already-indexed projects, their virtualenvs, their
+vendored dependencies), and three days later it was **27 GB** and still going,
+holding three cores the whole time on a machine whose owner had not written a
+line of code since.
+
+Nothing had gone wrong, exactly. Every part did its job. The index simply
+should never have existed.
+
+The server opens an existing index now and creates nothing. Asked to read where
+there is no index, it says so and points at `rtfm init` — which remains the
+only thing that creates one. Refusing costs a sentence; creating cost the disk.
+
+The edit hooks were never part of this: they already checked that the database
+existed before doing anything.
+
+## [0.28.2] — 2026-08-29
+
+### Fixed — a job nobody is running gets handed back
+
+A `running` row is a claim: something said "this one is mine" and owes the
+queue a closing write. When the claim broke and nobody noticed, the file was
+silently never indexed — no retry, no failure, no log line. On one machine
+twenty-six jobs sat that way for up to **fifty hours**, under a supervisor
+that was up, healthy and busy the whole time.
+
+The reason they never came back is that the only reclaim ran at startup.
+`reap_zombies` could be told to protect exactly **one** live job, read from
+the per-project worker's state file — the model where one worker owned one job
+at a time. The supervisor runs a dozen jobs per project and never wrote that
+file, so the reaper's only honest answer was "nothing is live", and reaping on
+that answer would have yanked every in-flight job back into the queue. It was
+therefore safe exactly once, at boot, and unusable for the rest of the
+daemon's life.
+
+`reap_zombies` now takes the set of job ids the caller is actually running,
+and the supervisor — the only place those ids exist — sweeps every minute
+against its own in-flight set. A claim broken at 11:50 is repaired by 11:51
+instead of at the next restart. Kept ids are still released after three hours:
+a claim held that long is a deadlock, not a worker.
+
+Three ways a claim could break, all closed:
+
+- **A dispatch that raised after claiming.** `dequeue` marks the row running
+  before the pool accepts the job; a refused submit left a row belonging to
+  nobody. The claim is handed back now.
+- **A closing write that failed.** `mark_failed` swallowed its exception
+  outright and `mark_done` logged one and moved on, so a write lost to a
+  locked database stranded the row with no trace anywhere. Closes are retried,
+  and a lost one is reported.
+- **An error the reaper did not catch.** A `BaseException` from a finished job
+  escaped after the job had already been removed from the in-flight set.
+
+Also fixed: `rtfm sync`'s progress watcher reaped stale rows on the same blind
+"nothing is live" answer, every ten seconds, while the supervisor worked —
+requeueing jobs from under it so the same file could be indexed twice at once.
+The watcher no longer reaps; `rtfm queue reap` now declines while a supervisor
+is alive and says why.
+
+### Removed
+
+The per-project `worker_state.json` model — `WorkerState`, `read_state`,
+`write_state`, `worker_running`. Nothing had written it since the supervisor
+replaced the per-project worker; the zombie reaper was its last reader.
+
+## [0.28.1] — 2026-08-23
+
+### Fixed — `rtfm sync` obeys the selection rules you registered
+
+A source registered with `--exclude` (or `--include`) kept its patterns in the
+project configuration, and `rtfm sync` scanned without them. Every excluded
+path was indexed anyway, with no warning and no error — on the index that
+surfaced the bug, 312 files that had been explicitly excluded. The periodic
+scan honoured the patterns, so this only bit projects driven by hand, with the
+edit hook off. Reported in [#6](https://github.com/roomi-fields/rtfm/issues/6),
+with a diagnosis precise enough to fix from.
+
+The cause was four places describing a source by hand for the scan they
+enqueue: the supervisor, the read-repair path, `rtfm sync` and `rtfm doctor`.
+They had drifted — one dropped the patterns, another the gitignore preference,
+a third both. There is now a single description used by all four, and a guard
+that fails the build if a fifth caller starts writing its own.
+
+Consequences beyond the reported bug:
+
+- **Narrowing no longer widens.** `rtfm sync --corpus docs` runs *which*
+  source you asked for, with the rules it was registered with, instead of
+  reconstructing a rule-free source of the same name.
+- **Health checks agree with reality.** `rtfm status --health` applied no
+  patterns either, so it counted excluded files as "not yet indexed" and sent
+  you to a sync that would never index them.
+- **Fewer redundant scans.** Payloads that differed only in how they spelled a
+  default could not match each other, so the queue deduplicated less than it
+  should.
+
+### Changed — a sync says what it selected
+
+The failure above was invisible: an over-broad index looks exactly like a
+successful sync. `rtfm sync` now prints the rules each scan carries —
+`[docs] /path/to/project  ext=md exclude=data/*,.agents/*` — so a dropped
+pattern shows up on screen instead of in a database query weeks later.
+
+## [0.28.0] — 2026-08-21
+
+### Added — a read repairs the index before answering
+
+Noticing that a file has drifted is worth little if the answer is wrong
+anyway. When a search or an expand finds a source that no longer matches its
+index, RTFM queues the fix at top priority, **waits for it** (about a second
+for a single file), and answers from the corrected index — ranking and line
+ranges included. Only when the repair does not land inside the budget does it
+fall back to reporting the drift.
+
+The same applies to the answer read-time checking cannot inspect: **"no
+results"**. With nothing returned there is no file to compare against disk, so
+an empty answer would sail past every guard — and "this does not exist" is the
+most expensive kind of wrong: it sends an agent off to rewrite code that is
+already there. An empty answer now earns a look at the disk. First it drains
+whatever the edit hook queued; failing that it scans the project's sources
+outright and asks again — affordable only because a scan no longer re-reads
+untouched files (0.04 s over 431 files, 0.15 s over 1 708). That covers the
+last gap: a file changed by a shell command, a build step or a `git checkout`,
+which no hook announced and no result could reveal.
+
+The catch-up scan refuses to guess: without a project configuration naming its
+sources it does nothing, rather than risk scanning the wrong tree with the
+wrong rules.
+
+The write still happens in the supervisor, never in the reader: one writer per
+database is what keeps them from corrupting.
+
+The budget is `RTFM_FRESH_WAIT_SECONDS` (default 3 s); `0` restores
+report-only behaviour. `rtfm search` on the command line does the same — an
+agent shelling out must not be the one path that quietly answers from stale
+rows.
+
+### Added — RTFM tells you when it is answering about a file that changed
+
+An index is eventually consistent, so between an edit and the re-ingest there
+is a window where RTFM describes a file that no longer exists in that form.
+Measured on a 25-project machine: **104 s** from an agent's edit to the file
+being searchable. An agent searching in that window got answers about the past
+with no way to know it.
+
+RTFM no longer pretends otherwise. Every file it answers with is checked
+against disk at read time — size, then mtime, then an MD5 for anything under
+2 MB — and disagreement is stated inline:
+
+```
+/home/me/proj/api.py L40-88 (class Client) ⚠ modified since indexing
+```
+
+`rtfm_expand` says it too, and spells out the consequence: the content shown is
+read live off disk and is always current, but the *line ranges* and section
+boundaries come from the index and may have shifted. Noticing drift also queues
+a top-priority re-ingest, so the next search is right. Verdicts are `modified
+since indexing`, `deleted since indexing` and `never indexed`.
+
+Cost is one `stat` per returned result. There is no configuration.
+
+### Changed — an edit by an agent is now top priority, with a lane to run in
+
+The PostToolUse hook queued the just-written file at the same priority as
+background document work, so on a busy machine it waited behind the entire
+backlog. It is now queued at `P_USER`, ahead of everything.
+
+Priority alone turned out not to be enough: it decides who takes the *next*
+free lane, and on a 25-project fleet there is no next free lane for minutes —
+a scan of a large or network-mounted corpus holds one for as long as it takes.
+Measured: a `P_USER` ingest still pending after 125 s with all twelve lanes
+held by scans. The supervisor now keeps **two lanes in reserve for `P_USER`
+work only**. These jobs are single-file ingests, so the extra capacity costs
+almost nothing.
+
+### Fixed — one unreachable network mount froze indexing for every project
+
+The supervisor's scheduling thread resolved each configured source path
+(`Path.resolve()`) before queueing its scan. `resolve()` stats every path
+component, so a single source on a slow or unreachable network mount parked
+that thread in uninterruptible I/O — and with it dispatch, reaping and
+scheduling **for all 25 projects**. Observed live: twelve jobs finished and
+unreaped, nothing dispatched for minutes, a `P_USER` ingest pending the whole
+time, while the main thread sat in a 9p wait on `/mnt/…`.
+
+Scheduling is now purely lexical and never touches a source filesystem. The
+scan handler resolves the root for real, in a pool thread, where blocking
+costs one lane instead of the machine.
+
+### Fixed — a file that cannot be parsed was retried on every scan, forever
+
+A failed ingest writes no tracking row, so the next scan saw the file as new
+again and queued it again. On a corpus with a few thousand broken PDFs that is
+not a backlog, it is a permanent storm: **50 000 failed jobs in twenty
+minutes**, measured, burning the very lanes fresh work needs (and five times
+worse since the scan interval dropped to 60 s).
+
+Failures are now recorded with the content's fingerprint. The same bytes are
+never re-queued; change the file and it is picked up on the very next pass, no
+intervention. When the cause was environmental rather than the file — OCR now
+installed, a mount repaired — `rtfm failed --retry` (optionally `--corpus`)
+re-opens them.
+
+### Fixed — a restart no longer blinds the fleet for ten minutes
+
+Every supervisor start integrity-scans each project database before serving
+it — reading, on this machine, some 20 GB. That ran on the scheduling thread,
+one project after another, so nothing at all was indexed until the last check
+finished; the new watchdog named the step within a minute of shipping.
+
+Projects now open on a small side pool and each joins the fleet the moment its
+own check passes, so a small project is served while a large one is still
+being verified. The guarantee is unchanged: every database is still
+integrity-checked before it is serviced.
+
+### Added — the supervisor says when its scheduling loop is stuck
+
+A blocked scheduler looks exactly like an idle one from outside: no jobs
+running, no errors, nothing in the log. A watchdog now names the step and how
+long it has been in it, so "the fleet stopped indexing" stops being a mystery:
+
+```
+STALL: scheduling blocked in 'enqueue-periodic' for 62s — no project is being served
+```
+
+### Changed — a scan no longer re-reads files that did not change
+
+`compute_diff` used to MD5 **every file on every pass** — the whole corpus,
+re-read every scan, for every project. It now skips the hash when size *and*
+mtime both say the file is untouched, and only trusts mtime when it is at
+least a second older than the indexing stamp (so a file rewritten around the
+moment it was indexed is re-read, not trusted). Measured 3–6× faster with
+identical verdicts; the gain grows with corpus size.
+
+That made a frequent scan affordable, so **the idle scan interval drops from
+300 s to 60 s** while still costing less than before. This is the discovery
+latency for everything the edit hook cannot see: files written by a shell
+command, a build step, a `git checkout`, or another agent.
+
+### Fixed — the edit hook skipped files with no parser (0.27.0 regression)
+
+0.27.0 made RTFM index all text, but the hook still filtered on "does a parser
+claim this file". Extension-less and exotic files (BP3 `-gr.*` data, `.bps`,
+`.gr`) were therefore never enqueued on edit and waited for the next scan. The
+hook now applies the source's own `extensions`/`include`/`exclude` rules and
+refuses only genuinely binary content — the same contract as the scanner.
+
+### Changed — hook scripts are stubs, and update themselves
+
+The scripts written into `.claude/hooks/` used to carry their logic inline, so
+a project kept running whatever RTFM version created it — which is why the
+regression above would have survived any number of upgrades. They are now thin
+stubs delegating to `rtfm.plugin.hook_runtime` in the installed package, and
+the heartbeat hook rewrites outdated stubs on the next prompt. **No re-`init`
+is needed**; existing projects self-heal.
+
+## [0.27.0] — 2026-08-19
+
+### Changed — index all text by default; a parser is a bonus, not a gate
+
+RTFM used to select files by an extension allow-list, so any file whose
+extension it lacked a parser for was silently skipped. That is the wrong
+default for a retrieval layer: **a file with no parser is still worth indexing
+as text.** The scanner now indexes **every file by default** — binary content
+is filtered at ingest (a file with no registered parser is read as plain text
+when textual, skipped when binary). A registered parser is now purely a
+*structuring* bonus (headers, symbols, tables); it no longer decides whether a
+file is indexed at all.
+
+**Upgrade impact:** on the next scan, a source with no explicit `extensions`
+indexes all of its text (previously only known extensions). `.gitignore`,
+`.rtfmignore`, and the always-excluded dirs still apply — use them, or the new
+`exclude` rules below, to keep noise out (lock files, source maps, minified
+bundles).
+
+### Added — prefix / suffix / glob selection rules per source
+
+Selection is no longer suffix-only. A source can carry `include` and `exclude`
+pattern lists — for files that encode their type in a **prefix** (Bol
+Processor's `-gr.*`, `-se.*`), a **suffix** (`*.bps`), or a **path** glob
+(`fixtures/*`):
+
+```
+rtfm add <path> --include='-gr.*,*.bps' --exclude='*.min.js,package-lock.json'
+```
+
+`include` restricts selection to matching files; `exclude` drops matches; a
+bare `extensions` allow-list still works and composes as a suffix restrictor.
+(Patterns beginning with `-` collide with option parsing — pass them as
+`--include=-gr.*`.)
+
+## [0.26.8] — 2026-08-19
+
+### Added — index files with no extension or an unknown one
+
+RTFM selected files by extension only, so whole families of files were
+invisible: those that encode their type in a **prefix** (Bol Processor's
+`-gr.dhati`, `-se.tempo`, `-da.…`), those with an **unregistered** extension
+(`.bps`, `.gr`, `.bpsl`), and **extensionless** files (`CHECK_THIS`). One repo
+had ~1,600 language files on disk and zero indexed. Two generic additions —
+no format-specific parser in the package:
+
+- **Index-all selection.** A source whose `extensions` includes `*` (e.g.
+  `rtfm add <path> -e '*'`) indexes **every** file, suffix ignored. `.gitignore`,
+  `.rtfmignore`, and the always-excluded dirs (`.git`, `node_modules`, `.rtfm`,
+  …) still apply, so noise stays out.
+- **Text catch-all at ingest.** A selected file with no registered parser is
+  indexed as plain text when it is textual, and skipped — not failed — when it
+  is binary (detected by a NUL byte). So an index-all tree pulls in every
+  grammar, setting, and data file as searchable text while `.mid` and other
+  binaries are passed over cleanly, with no re-ingest churn.
+
+Together these let a source index an arbitrary tree without a bespoke parser
+per exotic format — the extensibility path stays for structured parsing, but
+is no longer required just to make files searchable.
+
+## [0.26.7] — 2026-08-19
+
+### Fixed — `rtfm remove` exits non-zero when nothing matched
+
+`rtfm remove` returned success even when no source matched, so a script could
+not tell "removed something" from "there was nothing to remove". It now exits
+non-zero (like `grep`) on no match, and zero only when it actually removed a
+source.
+
+## [0.26.6] — 2026-08-19
+
+### Added — `rtfm remove` unregisters a source
+
+`add` registered a source and `sources` listed them, but nothing removed one —
+so undoing a source meant hand-editing `.rtfm/config.json`, which is exactly
+what the tooling exists to avoid. `rtfm remove` (alias `rm`) closes the gap:
+
+- `rtfm remove <path>` — unregister that source (any corpus).
+- `rtfm remove --corpus <name>` — unregister every source in a corpus.
+- `rtfm remove <path> --corpus <name>` — unregister that one entry.
+
+The path is matched both resolved and as-stored, so a source whose directory
+no longer exists (deleted upstream, or a mount that is down) can still be
+unregistered — removal is often needed precisely because the target is gone.
+Backed by `rtfm.config.remove_source`.
+
+## [0.26.5] — 2026-08-03
+
+### Fixed — scan starved removals and ingestions; the index silently diverged
+
+Measured across 25 mutualised projects, the supervisor was scanning, not
+indexing: 9 of 12 lanes ran `scan` jobs, 0 ran ingest/remove/embed, while
+hundreds of ingestions and removals sat pending for hours. Two independent
+bugs, now fixed:
+
+- **Priority starvation.** Scan was priority 10, remove 20, ingest 30 — and a
+  scan is re-enqueued every interval per source. With many projects a fresh
+  scan (high priority) perpetually preempted removals and ingestions queued
+  far earlier, so the machine re-discovered work forever and never served it.
+  Remove, ingest **and** scan now share **one priority tier** (`P_DOC`),
+  served in strict arrival order across all projects, exactly as intended in
+  0.26.0. A just-enqueued scan sorts *after* older pending work instead of
+  jumping the queue; `embed`/`ocr` stay strictly below so an embedding backlog
+  can never starve index-correcting work. `P_USER` still preempts everything.
+  The idle re-scan cadence is also relaxed from 30 s to 300 s per source — a
+  30 s per-source loop across dozens of projects churned CPU for no benefit
+  (an explicit `rtfm sync` still lands a file immediately).
+
+- **Mass-removal circuit breaker refused genuine deletions forever.** The
+  guard refused an entire removal batch when it exceeded 25 files *and* 25 %
+  of a corpus — the signature of a mount glitch, but also of any legitimate
+  large deletion. Repos that genuinely dropped 30–80 % of a corpus had every
+  removal refused on **every** scan (one tripped it 15 747 times), so dead
+  documents accumulated in the index with nothing in the queue counters to
+  show it. Replaced by **per-file confirmation** (`confirm_removals`): a file
+  is removed only when it is genuinely absent *and* a readable directory
+  ancestor up to the scan root proves the location was really visited. A file
+  that reappears on re-stat (transient miss) or whose mount went dark (root
+  unreadable) is kept — the same protection against a disappeared mount, without
+  ever refusing a real deletion. `force_remove` still bypasses for deliberate
+  bulk deletes.
+
+### Fixed — diagnostic tooling gaps
+
+Four rough edges that made cross-project queue diagnosis unreliable:
+
+- `rtfm queue` now accepts `--db PATH` (like `rtfm files` / `rtfm status`), so
+  a project's queue can be inspected from anywhere instead of only from inside
+  its own tree.
+- `rtfm queue list` / `failed` now report `… showing N of M` when the output
+  is truncated (default limit 20), and `--limit 0` lists everything. Before,
+  a 53-job queue silently showed 20 with no hint the rest existed.
+- The CLI and MCP server now share **one** path resolver
+  (`rtfm.core.pathresolve`). The CLI previously resolved with an empty corpus
+  and always returned relative paths while the MCP returned absolute ones — the
+  same search result reported two different paths, and "restore a deleted file"
+  flipped a path from relative to absolute on one install but not another. Both
+  now apply the identical rule: absolute when the file exists under its corpus's
+  sync root, relative otherwise.
+
+## [0.26.4] — 2026-08-03
+
+### Fixed — runtime DB corruption hot-looped the dispatcher for days
+
+The boot-time integrity guard only runs when a project's slot is opened. A DB
+that went **malformed while the supervisor was already running** (a hard kill
+or OOM landing mid-write) was never re-checked: every dispatch pass called
+`peek`, caught `file is not a database`, logged it, and moved on — then did it
+all again on the next pass, dozens of times a second. One project (`un-chemin`)
+spun that loop for four days, burning a full core (338 % CPU) and destabilising
+the shared service for every other project. The dispatcher now recognises a
+corruption-class error at `peek`/`dequeue` and self-heals the slot in place:
+quarantine the malformed file, reopen a fresh DB, and schedule an immediate
+rebuild scan from source — the same recovery the boot guard performs, but
+triggered at runtime. Transient `database is locked`/`busy` is explicitly *not*
+treated as corruption, so a live DB is never quarantined by mistake.
+
+## [0.26.3] — 2026-07-29
+
+### Fixed — chunk_id collisions aborted whole ingests
+
+Parsers derive a chunk's id from its content alone (`md5(text)[:12]`), but
+`chunks.chunk_id` is UNIQUE across the whole DB. Any two chunks with identical
+text — a PDF's blank/boilerplate pages, or the same passage in two books —
+collided and aborted the entire ingest with `UNIQUE constraint failed:
+chunks.chunk_id`. One repo accumulated ~69 k such failures. Stored chunk ids
+are now scoped to the book (`slug:rawid`) with a `#n` suffix for genuine
+within-book duplicates, so identical content never collides. Content-hash
+semantics (dedup, search) are unchanged.
+
+## [0.26.2] — 2026-07-29
+
+### Reverted — integrity scan runs at every startup again
+
+0.26.1 skipped the boot-time `PRAGMA quick_check` after a clean shutdown to
+speed up restarts. Reverted at the operator's request: the full integrity
+scan now runs on **every** supervisor start, as it did through 0.26.0. The
+guarantee (never let a hard-kill-mid-write corruption go undetected) is worth
+the slower boot on multi-GB indexes. The clean-shutdown marker mechanism is
+removed entirely.
+
+## [0.26.1] — 2026-07-29
+
+### Changed — no integrity scan at every startup
+
+The boot-time integrity guard ran a full `PRAGMA quick_check` on **every**
+project DB at **every** supervisor start, serially. On a multi-GB index that
+is minutes of work before anything gets indexed (a 10 GB DB took ~4 min), and
+it repeated on every restart/upgrade/recycle.
+
+A DB can only be corrupted by a hard kill landing mid-write, so the deep scan
+is only ever needed after an **unclean** exit. The supervisor now records a
+clean-shutdown marker at the end of a graceful stop (all in-flight jobs
+finished, all DBs closed) and consumes it at boot: present ⇒ last exit was
+clean ⇒ skip the scans (near-instant start); absent ⇒ crash / SIGKILL / OOM /
+first run ⇒ deep-check everything, exactly as before. The quarantine-and-
+rebuild-once safety net is unchanged for the case that actually needs it.
+
+## [0.26.0] — 2026-07-29
+
+### Changed — global arrival-order scheduling, all idle cores, per-project write concurrency
+
+Real-world use of the 0.25.0 supervisor surfaced a scheduling bug and a
+liveness-reporting bug that together left a freshly-added corpus un-indexed
+for 24 h. The scheduler is reworked, concurrency raised, and the
+single-writer rule refined so one project can use several cores:
+
+- **Global arrival order.** The dispatcher served projects in a fixed
+  alphabetical order, so the first projects with backlog occupied every
+  lane forever — a project low in the alphabet never got a turn. Dispatch
+  now processes documents in the **order they were queued, across all
+  projects**: it peeks each project's head job and serves the globally
+  oldest by `(priority, created_at)`. Explicit P0 work still preempts.
+- **Uses all idle cores.** The concurrency default is now the machine's
+  core count instead of 4, so background indexing fills otherwise-idle CPU
+  across every core. Each job stays capped to one embedding thread and the
+  supervisor runs `nice 19` + `ionice`, so there is no oversubscription and
+  interactive work is never starved. Override per machine via
+  `max_concurrent_indexers` in `~/.rtfm/config.json` or
+  `RTFM_MAX_CONCURRENT_INDEXERS`.
+- **Per-project write concurrency.** 0.25.0 ran at most one job per project
+  (strict single writer). A single big import therefore used one core while
+  the rest sat idle. Now the parallelisable job types — `ingest`, `embed`,
+  `remove` — run **concurrently within a project** (they touch disjoint
+  rows; SQLite WAL serialises the actual writes), so one import fills every
+  core. Whole-index / exclusive-lock jobs (`scan`, `reconcile`, `vacuum`)
+  still run alone per project. The corruption class 0.25.0 closed stays
+  closed: in-flight jobs are never hard-killed on shutdown, and the
+  integrity guard quarantines-and-rebuilds once should a DB ever go bad.
+  The RSS recycle ceiling is now clamped to 60 % of physical RAM so it
+  stays meaningful at a core-sized pool.
+- **False liveness → `stop` no-op, double supervisors.** `worker status`
+  read the lazily-written state file, which is absent during the
+  multi-second model preload right after a restart — so it reported "not
+  running" while the daemon was up, `stop` killed nothing, and `start`
+  spawned a *second* supervisor. Liveness now comes from the global
+  `flock` (the kernel-authoritative signal), and the state snapshot is
+  written before the preload.
+
+### Fixed — files still being written, and quieter failure modes
+
+- **Partial-write ingest.** A file whose download/rsync finished
+  mid-scan was parsed truncated, failed with a format error, and stayed
+  failed for good. A parse failure on a file that changed under us (or is
+  still changing) now re-queues the ingest instead of failing it; a
+  genuinely broken, settled file still fails as before.
+- **Silent `sync` hang.** `rtfm sync` now says so when jobs are pending
+  but no lane is serving the project (supervisor busy elsewhere or down),
+  instead of blocking mutely until timeout.
+- **`status` optional extras.** The extras section now reports every
+  optional reader — epub, mobi, xlsx, docx/odt/rtf (office), djvu — so a
+  supported extension whose reader is missing is visible up front rather
+  than failing file-by-file at ingest.
+
+## [0.25.0] — 2026-07-25
+
+### Changed — one mutualised worker replaces the per-project daemon fleet
+
+RTFM ran **one background daemon per project** — 16 resident processes
+on a 6-core laptop, each idle-scanning every 30 s, each an independent
+writer to its own `library.db`. That model had three problems this
+release fixes at the root:
+
+- **DB corruption.** Nothing guaranteed a single writer through a
+  respawn/hard-kill window: a `SIGKILL` (from `restart-all`'s 3 s grace,
+  or the OOM-killer) landing mid-write could corrupt a DB. Once corrupt,
+  the worker could no longer tell which files were indexed and re-ingested
+  everything on every scan — one project looped that way for weeks,
+  growing a 2 GB DB and a 2.4 GB log.
+- **Load spikes.** All workers scanned on the same 30 s tick; a burst of
+  file churn made every project re-hash at once.
+- **16 resident processes** each loading their own embedding model.
+
+The new **supervisor** (`rtfm.core.supervisor`) is a single process that
+services every registered project's queue with a bounded thread pool and
+**never runs two jobs for the same project at once** — so each DB has
+exactly one writer at any instant, eliminating the corruption class.
+Scans are staggered across projects, the embedding model is loaded once
+and shared, and on shutdown in-flight jobs finish cleanly (no interrupted
+writes). `rtfm worker start|stop|status|restart-all` now drive the one
+supervisor; `ensure_worker_running()` still works unchanged for every
+producer (CLI, hooks, MCP) — it registers the project and ensures the
+supervisor is up.
+
+### Added — hardening (`rtfm.core.dbcare`)
+
+- **Integrity guard.** Every project DB is `PRAGMA quick_check`-ed before
+  it is serviced; a corrupt file is quarantined (`library.db.corrupt-*`,
+  kept for salvage) and rebuilt once from source — never looped on.
+- **Log rotation.** The worker log is capped (default 5 MB, one backup) so
+  a chatty or looping worker can't fill the disk.
+
+### Added — durable concurrency setting
+
+`max_concurrent_indexers` in `~/.rtfm/config.json` sets the concurrency
+cap persistently (survives respawns, unlike a `.bashrc` export that
+non-interactive shells never source). Precedence:
+`RTFM_MAX_CONCURRENT_INDEXERS` env → config file → built-in default.
+
+### Removed
+
+The per-project `Worker` loop, its `WorkerLock`, and the per-project
+delayed-respawn helper — replaced wholesale by the supervisor.
+
+## [0.24.12] — 2026-07-15
+
+### Added — project-local Python parsers (`.rtfm/parsers/*.py`)
+
+The Python counterpart of the declarative `.rtfm/mappings/` system:
+drop a module that registers a parser (via
+`@ParserRegistry.register`) into a project's `.rtfm/parsers/`
+directory and RTFM loads it **for that project only** — no core
+release needed. This is what keeps format-specific parsers (a single
+dictionary, one company's export layout) out of the shipped package.
+
+Loading happens at `Library` init, right after mappings. Files whose
+name starts with `_` are skipped; a parser that raises at import is
+skipped so one bad drop-in never breaks a sync. It `exec`s Python
+from the project's own `.rtfm/` — the same trust level as the
+repository's own source that RTFM already runs.
+
+To claim a subset of files whose extension another parser also
+handles, a drop-in overrides `BaseParser.matches(path)` (content
+routing, added in 0.24.11) and declares `extensions = []` so it
+never clobbers the generic parser's extension fallback.
+
+### Removed — XMLittré parser moved out of core
+
+The `littre` parser shipped in 0.24.11 was format-specific (one
+French dictionary) and did not belong in the package everyone
+installs. It is removed from core and now lives as a project-local
+drop-in where it is used. The generic mechanisms that make that
+possible — content routing (`matches()`) and the local-parser loader
+above — stay in core.
+
+## [0.24.11] — 2026-07-15
+
+### Added — XMLittré parser (`littre-dictionnaire.xml`)
+
+> **Superseded by 0.24.12** — this parser was moved out of core into
+> the project-local `.rtfm/parsers/` mechanism. The content-routing
+> hook it introduced stays in core.
+
+
+The XMLittré dictionary distributed by François Gannaz concatenates
+26 per-letter blocks into a single `<littre-consolide>` wrapper, each
+carrying its own `<?xml ?>` declaration and `<!DOCTYPE>`. Standard
+XML parsers reject the result (`XML or text declaration not at start
+of entity`), which had the 93 MB Littré file spamming ~7000 failed
+ingest attempts in the viasophia queue.
+
+`rtfm.parsers.littre.LittreParser` strips the interior declarations
+before feeding the text to `xml.etree.ElementTree.iterparse`,
+streaming one chunk per `<entree>` element (78 599 entries in the
+current file) with peak memory bounded by aggressive `elem.clear()`.
+
+Registration also introduces a content-based routing hook: parsers
+that override `BaseParser.matches(path)` are consulted before the
+extension map, so Littré wins over the generic Legifrance XML parser
+on the one file it claims and every other `.xml` still routes to
+Legifrance unchanged.
+
+## [0.24.10] — 2026-07-14
+
+### Fixed — the thread cap actually reaches onnxruntime now
+
+0.24.9 shipped an env-var cap (`OMP_NUM_THREADS=1` etc.) and confirmed
+it landed in the worker process. But onnxruntime's intra-op thread
+pool is *not* controlled by OpenMP env vars — it is only bounded by
+`SessionOptions.intra_op_num_threads`. Verified live on PC2: workers
+running the 0.24.9 cap still spawned 12 intra-op threads and used
+~400 % CPU.
+
+fastembed exposes the knob via its `TextEmbedding(threads=…)`
+constructor argument. `get_model()` now reads `RTFM_EMBED_THREADS`
+(default `1`) and passes it through. One active worker ⇒ one core,
+as originally intended. `RTFM_EMBED_THREADS=0` restores fastembed's
+default (`cpu_count / 2`).
+
+## [0.24.9] — 2026-07-14
+
+### Fixed — worker no longer saturates the CPU on multi-project boxes
+
+On a machine hosting many `.rtfm/` projects (16 registered on PC2),
+a single active worker would open one intra-op thread per core in
+`onnxruntime` (~5-6 cores) and multiple concurrent embed jobs would
+push the load average past 30 — enough to make VS Code Remote-SSH
+disconnect and lose every open terminal.
+
+Two independent throttles, both opt-out:
+
+- **Per-worker thread cap** — every worker daemon is spawned with
+  `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `NUMEXPR_NUM_THREADS` all set to `1` (belt-and-suspenders: also set
+  at daemon boot before any fastembed import). One active worker ⇒
+  one core, instead of one worker ⇒ six cores. Override with
+  `RTFM_EMBED_THREADS=<n>` (`0` disables the cap entirely).
+- **Cross-project semaphore** — file-lock pool in `~/.rtfm/slots/`
+  caps how many workers may run a *heavy* job (`ingest`, `embed`,
+  `ocr`) at the same time across all projects. Default `4`; override
+  with `RTFM_MAX_CONCURRENT_INDEXERS=<n>` (`0` = unlimited). Scan /
+  remove / reconcile stay unbounded so the queue never starves.
+
+Waiting on a slot is interruptible: `SIGTERM` to the worker sends
+the pending job back to `pending` (without consuming a retry attempt)
+and exits cleanly.
+
+## [0.24.8] — 2026-07-04
+
+### Fixed — `reconcile` now sweeps fossil chunks that trigger `UNIQUE constraint failed: chunks.chunk_id`
+
+A chunk's `chunk_id` is computed at parse time from its book's slug.
+When a cross-corpus move or an old rename updates the `book` row's
+slug without regenerating the chunks, the chunks keep their
+old-slug-prefixed `chunk_id` forever. Downstream symptom: every
+future ingest of a file whose current slug collides with those
+fossils fails with `IntegrityError: UNIQUE constraint failed:
+chunks.chunk_id`. On viasophia this stuck 258 ingest jobs on two
+files (`bibliographie-contemporaine.md`, `citations.json`) — the
+worker retried them at every scan tick.
+
+`reconcile()` now detects and purges fossil chunks (`chunk_id NOT
+LIKE book.slug || '%'`) as its second step, right after the orphan
+embedding pass. Refreshes `books.chunk_count` in the same pass so it
+stays consistent. Runs on every worker idle-reconcile tick, no user
+action needed. Stats dict gains a `fossils_purged` field.
+
+## [0.24.7] — 2026-07-04
+
+### Added — `.rtfmignore`, the missing exclude list
+
+A project can now drop a `.rtfmignore` at its root to exclude files
+from the index regardless of `.gitignore`. Same syntax as
+`.gitignore` (`gitwildmatch` via `pathspec`). Applied **always**, so
+it composes cleanly with the two modes of gitignore handling:
+
+- `honor_gitignore: true` (default) — both filters apply. A file
+  matched by either is skipped. Use `.rtfmignore` when you want to
+  index something git-tracked but keep noise (e.g. generated `.json`)
+  out of RTFM search.
+- `honor_gitignore: false` — `.gitignore` is bypassed to expose a
+  private corpus, but `.rtfmignore` still applies. That's the fix for
+  the ergonomics gap surfaced on viasophia: opting out of gitignore
+  to index copyrighted PDFs would drag in `dist/`, `node_modules/`,
+  `.astro/`, etc. A `.rtfmignore` listing those paths keeps them out.
+
+Also worth noting (already existed, better documented now): each
+source in `.rtfm/config.json` supports a per-source `"extensions"`
+key — comma-separated list of extensions to restrict the scan to.
+E.g. `{"path": "…/corpus", "extensions": "pdf,epub,md"}` to only
+index those three formats for that source.
+
+## [0.24.6] — 2026-07-04
+
+### Fixed — worker's periodic scan silently reverted `honor_gitignore=false` and mass-removed private corpora
+
+The 0.24.5 fix let a CLI `rtfm sync --no-gitignore` (or a source with
+`"honor_gitignore": false`) index a private corpus. That worked once —
+then the worker daemon's periodic scan tick (every 30 s by default)
+enqueued a fresh scan job **without** propagating `honor_gitignore`
+from the source config. The scan defaulted back to `true`, didn't see
+the gitignored PDFs anymore, decided they had disappeared from disk,
+and enqueued 172 `remove` jobs. On viasophia the whole PDF corpus
+(Tsing, Escobar, Deleuze, Nishida…) vanished from the index minutes
+after being indexed.
+
+`Worker._maybe_scan` now reads `honor_gitignore` from each source
+entry and passes it into the scan payload. Same wiring as
+`cmd_sync` uses in the CLI. Fixed forever, no more races between the
+one-shot fix and the automatic sweep.
+
+## [0.24.5] — 2026-07-04
+
+### Fixed — private corpora ignored by RTFM because they were also .gitignored
+
+`scan_directory` respects the root `.gitignore` by default so build outputs
+and caches don't need to be redeclared as RTFM excludes. But that also swept
+up a legitimate use case: **a corpus of copyrighted PDFs / EPUBs kept out of
+git on purpose, but meant to be searchable locally**. On the viasophia repo,
+`corpus/contemporain/**/*.pdf` and `corpus/peuples-premiers/**/*.epub` were
+gitignored (author rights, private-use-only), so 162 books were silently
+skipped by every sync. Zero `.pdf` / `.epub` rows in `indexed_files`.
+
+Users can now opt out:
+
+- **Per-source** (persistent): add `"honor_gitignore": false` to any entry
+  under `sources[]` in `.rtfm/config.json`. Recommended for corpus roots
+  whose whole point is to hold private files.
+- **Per-run**: `rtfm sync --no-gitignore`. Applies to any source that
+  didn't explicitly set the field.
+
+Default stays `true` — pure backwards compatibility for every existing repo
+that relied on `.gitignore` to keep build outputs out of the index.
+
+Plumbed through `sync()`, `scan_directory()`, `handle_scan` (payload
+`honor_gitignore: bool`), and the CLI (`--no-gitignore`).
+
+## [0.24.4] — 2026-07-03
+
+### Fixed — CLI / worker daemon now see the plugin's extras venv
+
+The 0.24.2 fix wired the extras venv into `bin/rtfm-hook`, so
+Claude-Code-launched hook subprocesses could import optional parsers
+(pdftext, ebooklib, openpyxl, …) and fastembed. But the CLI itself
+(`rtfm sync`, `rtfm worker-daemon`, `rtfm ocr-worker`, …) runs from the
+pipx venv where those libs are typically absent, so any indexing done
+outside the plugin hook was still blind. Users had to export
+PYTHONPATH manually — the same workaround the viasophia agent shipped
+locally.
+
+`rtfm/__init__.py` now runs a tiny `_adopt_plugin_extras()` at import
+time: if `${CLAUDE_PLUGIN_DATA}/extras/venv` (or the default
+`~/.claude/plugins/data/rtfm/extras/venv`) exists, its site-packages is
+**appended** to `sys.path`. Any entry point that imports `rtfm` — CLI,
+worker daemon, MCP server, subprocess launched by a hook — automatically
+picks up the plugin's extras without user intervention. Appended (not
+prepended) so the current environment keeps priority: pipx-injected
+extras or a dev venv still win over the plugin fallback.
+
+No PYTHONPATH needed anywhere anymore.
+
+## [0.24.3] — 2026-07-03
+
+### Fixed — `rtfm-install-extras` now covers all optional formats
+
+The install script only knew `embeddings|pdf|pdf-full|all` — no way to install
+the EPUB, DOCX/ODT/RTF, MOBI, XLSX or OCR parsers via the official path. Users
+who hit an "ebooklib not installed" error had to fall back to a manual
+`pip install` inside the extras venv, and every fresh machine setup silently
+lost those formats. The migration WSL → native-Ubuntu on the viasophia corpus
+surfaced this: 124 EPUBs went from indexed to unparsable and nobody noticed
+until the search returned empty.
+
+`bin/rtfm-install-extras` (POSIX + `.cmd`) gains five new targets:
+
+- `epub` — ebooklib + beautifulsoup4
+- `office` — python-docx + odfpy + striprtf
+- `mobi` — mobi + beautifulsoup4
+- `ocr` — pytesseract + pypdfium2 + Pillow (needs `tesseract-ocr` on host)
+- `xlsx` — openpyxl
+
+And `all` now installs everything except `pdf-full` (the 1.5 GB torch tail
+stays opt-in).
+
+## [0.24.2] — 2026-07-03
+
+### Fixed — plugin hooks now see the extras venv (fixes silent PDF/EPUB skip)
+
+`bin/rtfm-serve` already injected the plugin's extras venv (`~/.claude/plugins/data/rtfm/extras/venv`) into `sys.path` so the MCP server could import `pdftext`, `ebooklib`, `openpyxl`, `fastembed`, etc. `bin/rtfm-hook` did not — it launched `python3` naked. Which meant that when the SessionStart / Stop / UserPromptSubmit hooks called `rtfm.core.sync`, any PDF, EPUB or spreadsheet touched during the session was silently skipped (parser import failed → file marked unparsable, no visible error). Surfaced by the WSL → native-Ubuntu migration on the viasophia corpus: `rtfm-serve` could search extras-dependent files, but the hooks couldn't add new ones.
+
+Both `bin/rtfm-hook` (POSIX) and `bin/rtfm-hook.cmd` (Windows) now export `PYTHONPATH` pointing at the extras venv's `site-packages` before invoking the target hook script. Same detection logic as `rtfm-serve`. Zero behavior change when no extras venv exists.
+
+## [0.24.1] — 2026-06-07
+
+### Fixed — `rtfm queue retry-failed` no longer raises on duplicate failures
+
+When a pile of similar files all fail with the same shape of error (the 1330 broken EPUBs on viasophia), `retry_failed` tried to move them all to `pending` in one `UPDATE` and the unique-pending index rejected the second twin. The whole operation rolled back and nothing was retried. Same class of bug as the reaper case in 0.24.0.
+
+`retry_failed` now coalesces before the bulk update:
+
+- failed rows whose twin is already pending → dropped (the pending one wins).
+- failed rows that share `(type, payload)` with another failed row → only the one with the highest `attempts` survives, the rest are dropped.
+
+Two regression tests added.
+
+## [0.24.0] — 2026-06-07
+
+### Fixed — `rtfm sync` no longer hangs forever after a worker crash
+
+When a worker died mid-job (OOM-kill, WSL reboot, hard SIGKILL) the row stayed `running` in the queue forever, with no live worker behind it. `rtfm sync`'s exit condition was `pending == 0 AND running == 0`, so one zombie row meant the command waited indefinitely — a real cron once burned 4 h 24 min in this state before contributing to a host crash. Diagnosed and reproduced on this very repo (35 zombies accumulated since May 21).
+
+- **New zombie reaper** in `Queue.reap_zombies()`. Decides what's a zombie by reading `worker_state.json` rather than by timestamps: if no worker is alive, or if the live worker is on a different `current_job_id`, the row is a zombie. A 3 h `started_at` fallback covers the rarer case where the worker is alive but stuck. Zombies with `attempts >= 3` are marked `failed` instead of being requeued, so a single poisonous file can't loop forever.
+- **Auto-reap at worker boot** — first thing the worker does on startup, before draining anything.
+- **Auto-reap inside `_watch_jobs`** — one-shot before the wait loop + every 10 s during. So `rtfm sync` is now self-healing: if a worker dies while you watch, the next reap cycles its in-flight row.
+- **`--timeout <seconds>` flag on `rtfm sync`** — explicit ceiling. Returns exit code 2 on timeout (worker keeps draining in the background).
+- **`rtfm queue reap`** — manual remediation command with verbose per-row output (id, type, attempts, started_at, file path). Use after an unexpected hang.
+
+### Fixed — EPUBs with missing internal images now index instead of failing
+
+The `ebooklib` reader raised on the first manifest item missing from the ZIP (typically an interrupted-download EPUB with a missing image). 1329 EPUBs were stuck in `failed` on the viasophia repo for this reason. Now:
+
+- We detect the "no item named …" error specifically and fall back to a tolerant ZIP walker that iterates `.xhtml/.html` members directly, ignoring the manifest.
+- Chunks extracted via the fallback carry `source_status: "incomplete"` in their metadata, so callers can spot them.
+
+The Weil EPUB that triggered the issue extracts 191 chunks in the fallback path, instead of 0.
+
+### Schema
+
+No migration. The reaper uses the existing `started_at` column. The dedup logic handles edge cases where multiple zombie rows share the same `(type, payload)`: it keeps the one with the most attempts and deletes the duplicates, so the unique-pending index can't reject the requeue.
+
+## [0.23.0] — 2026-05-25
+
+### Added — worker respawn is now fully autonomous (no manual action)
+
+Up to 0.22 the worker self-exited cleanly on version drift or memory pressure, but the *respawn* still required a hook to fire (next user prompt in Claude Code) or an explicit `rtfm worker restart-all`. If the user installed an upgrade and walked away, the queue could sit idle for hours. Two new layers close the gap, both fully automatic:
+
+- **Fork-helper at clean exit.** When the worker self-exits (version drift / RSS over threshold), it forks a tiny detached process just before exiting. That helper sleeps ~6 s (enough for the worker's lock to be released) and calls `ensure_worker_running`, which spawns a fresh worker with the up-to-date code. SIGTERM (explicit `rtfm worker stop`) leaves the worker stopped — the helper only fires on self-managed exits.
+- **Lazy version check in every CLI command.** At the top of `cli.main()`, throttled to once per minute via a marker file at `~/.rtfm/last-version-check`, we scan every registered worker's `worker_state.json` for its `installed_version` and compare to the version the running CLI just loaded. Any mismatch silently triggers `rtfm worker restart-all` in the background. So the moment you run any `rtfm` command after `pip install`, every project's worker gets refreshed without you doing anything.
+
+`WorkerState` now includes `installed_version` (populated at worker startup) so the CLI can detect drift without spawning anything.
+
+New doc page **`docs/worker-lifecycle.md`** explaining the three respawn layers (fork-helper, lazy CLI check, session hooks), what stays manual (only a hard `kill -9` recovery), and where to look when something feels off. The doc is written for an end-user with no internals knowledge.
+
+## [0.22.0] — 2026-05-25
+
+### Added — `rtfm worker restart-all` for post-install respawn
+
+Since 0.19 the worker self-exits when a new version lands on disk, but nothing immediately respawns it — until the next user prompt fires `ensure_worker_running` via a hook. If you don't interact with the project for hours, the worker stays dead and the queue stalls. Bit us yesterday: musicology's worker exited at 22:14 on the 0.20 → 0.21 bump and sat idle until 11:00 the next day.
+
+- **New project registry** at `~/.rtfm/workers.json` — every `ensure_worker_running` / `_spawn_worker_direct` adds the project. Persistent across sessions.
+- **New action `rtfm worker restart-all`** — reads the registry, cycles every registered worker (SIGTERM → wait → SIGKILL fallback → drop stale state → respawn). Reports `old PID → new PID` per project. Use this as the standard post-`pip install` / post-`pipx install` step.
+
+After a deploy, the canonical sequence is now:
+
+```sh
+pip install --force-reinstall rtfm-ai==X.Y.Z
+rtfm worker restart-all
+```
+
+## [0.21.0] — 2026-05-24
+
+### Added — `rtfm failed` + richer `rtfm check` failure detail
+
+For bibliography-manager agents that need to route on **why** a file isn't searchable:
+
+- **`rtfm failed`** — flat machine-readable list of every job in `failed` status, with `bucket` (short stable category) + first line of the actual error + filepath + corpus. Filters: `--type`, `--corpus`, `--bucket`. Default format JSON; `-f text` groups by bucket for human reading. Exit 0 when nothing's failed, 1 otherwise — `rtfm failed && echo all-clean` works in shell pipelines.
+- **`rtfm check`** now adds `ingest_failure_reason` / `ingest_failure_error` and `ocr_failure_reason` / `ocr_failure_error` to its JSON output. Pulls the most recent failure for that file. Empty (null) when the file isn't in a failed state.
+
+Failure buckets so far: `pdf-format-invalid`, `file-vanished`, `duplicate-content`, `memory-exceeded`, `pdftext-other`, `ocr-tesseract-error`, `other`, `unknown`. New buckets are easy to add (single helper `_failure_bucket` in `rtfm/cli.py`).
+
+## [0.20.0] — 2026-05-24
+
+### Added — memory guard prevents OOM-kill of the whole worker
+
+A pathological PDF once made the worker consume ~13 GB of RSS, which triggered the kernel OOM-killer; the worker died without a graceful exit, lost in-flight state, and required manual recovery. Two layers of defence now:
+
+- **`RLIMIT_AS` cap at startup** (default 8 GB, configurable via `RTFM_WORKER_MEMORY_LIMIT_GB`). The next allocation past the cap raises `MemoryError` — catchable by the per-job handler, which marks the job `failed` and moves on. Converts a kernel `SIGKILL` into a normal Python exception.
+- **RSS polling at every idle tick**. Above `WORKER_RSS_EXIT_MB` (5 GB) the worker exits cleanly; the next hook respawns a fresh process. Catches slow leaks that wouldn't trip the per-alloc cap.
+
+Opt out with `RTFM_WORKER_MEMORY_LIMIT_GB=0` when running marker-pdf, whose ML models legitimately need 3-8 GB.
+
+Test suite: 568 passed.
+
+## [0.19.0] — 2026-05-23
+
+### Added — worker self-restarts after a version upgrade
+
+A long-running worker keeps the code it imported into memory at startup; a fresh `pip install --force-reinstall` (or `pipx install`) writes new files on disk but the running worker silently ignores them. Bit this project once already — workers from 0.15 era kept handling jobs while 0.17 / 0.18 lived on disk, so the new `handle_scan` never fired and ~1200 PDFs sat unindexed.
+
+Now at every idle tick the worker compares `importlib.metadata.version("rtfm-ai")` against the version it captured at startup. If they diverge, it logs `version changed on disk, exiting for restart` and exits cleanly. The next hook (UserPromptSubmit / PostToolUse) calls `ensure_worker_running`, which spawns a fresh worker with the up-to-date code. Source-checkout developers are unaffected — when either side reports `"unknown"` (no installed metadata) the check is a no-op.
+
+`rtfm check`, the CLI command introduced earlier today, also gains the `ocr_attempted` / `ocr_pending` / `ocr_failed` triplet (and the same `ingest_*` split) so consumers can route differently: `pending` → wait, `failed` → escalate to human, neither → fully done.
+
+Test suite: 566 passed.
+
+## [0.18.0] — 2026-05-23
+
+### Changed — every DB write now goes through the worker (no more inline path)
+
+The CLI, the hooks and the slash commands stop touching the DB directly. They become *producers* that enqueue jobs into a single 7-level priority queue; the worker daemon is the only consumer. This removes a whole class of bugs (concurrent writes from different RTFM versions, inline OCR that blocks the user's terminal for hours, hooks that ran a full destructive sync on every prompt) and makes the system observable: a `rtfm sync` shows live queue progress instead of a long opaque blocking call.
+
+Seven priority lanes, lowest number wins:
+
+- **P0** = explicit user (slash commands, manual CLI invocations)
+- **P1** = `scan` — detect changes in a source
+- **P2** = `remove` — drop a vanished file from the index
+- **P3** = `ingest` — parse one file → chunks
+- **P4** = `reconcile` / `vacuum` — short maintenance
+- **P5** = `embed` — vectorise a batch of chunks
+- **P6** = `ocr` — OCR a page-range of a scanned PDF
+
+What changed concretely:
+
+- **New job types**: `scan`, `remove`, `reconcile`, `vacuum`, each with its own handler in `rtfm/core/handlers.py`. The `scan` handler subsumes the old `_scan_once` method on the worker and the destructive `sync()` removed-path — including the mass-removal circuit breaker from 0.16.0.
+- **Worker periodic ticks** (`_maybe_scan`, `_maybe_reconcile`) now just enqueue jobs. The work happens in handlers. Queue dedup (`UNIQUE(type, payload) WHERE status='pending'`) keeps the queue clean across repeated ticks.
+- **CLI** — every mutating command (`rtfm sync`, `rtfm gc`, `rtfm doctor`, `rtfm reindex`, `rtfm vacuum`, `rtfm backfill-pages`) becomes "enqueue P0 + watch progress + exit". `--background` skips the watching loop. `rtfm sync --inline` is gone (the inline path is gone). `cli.py` shrank 2587 → 2274 lines.
+- **DB migration is automatic**: pre-0.18 DBs had a `CHECK(type IN ('ingest','embed','ocr'))` on `work_queue` that blocked the new job types. The first 0.18+ `Queue` open rebuilds the table in place, rows preserved.
+- **Docs**: `docs/architecture.md` rewritten for the new model (priority table, handler list, periodic-tick semantics).
+
+Test suite: 552 → 565 passed (24 skipped).
+
+## [0.17.0] — 2026-05-23
+
+### Fixed — stop indexing our own state directory (feedback loop)
+
+Some live DBs ballooned absurdly (RTFM 2.3 GB for 441 books, tradingbot 8.5 GB for 59 books). Forensics: the parser registry was happily ingesting `.rtfm/library.db` itself — every chunk of the index became more rows, which the next sync re-ingested, snowballing. New default excludes block this and other generic noise:
+
+- `.rtfm/` — RTFM's own state dir (library.db, logs, locks). Indexing it is always a bug.
+- `.cache/` — generic cache dirs (import caches, browser caches, build caches): always noise.
+- **Honor root `.gitignore`** — when `pathspec` is installed (now a core dep), `scan_directory()` filters out anything matched by the project's own `.gitignore`. Reuses what the user has already declared as ignored artifacts rather than maintaining a parallel exclude list. Nested `.gitignore` files in subdirs are not walked (root-only) — covers the vast majority of real-world setups while keeping the scan simple. Opt out with `honor_gitignore=False`.
+
+To purge the historical garbage on an already-polluted DB, run once: `rtfm sync --force-remove` (the mass-removal circuit breaker from 0.16 will otherwise block the cleanup since 90%+ of "files" disappear under the new excludes).
+
+## [0.16.0] — 2026-05-21
+
+### Fixed — sync no longer wipes a corpus on an incomplete scan (data-loss bug)
+
+A live corpus on NTFS-via-WSL lost ~500 fully-indexed PDFs (and their embeddings). Root cause: the session hooks ran a **full `sync()` of every source on every prompt**. While an external process was reorganising files on flaky NTFS, a scan caught a moment when hundreds of files were temporarily absent → `sync()` flagged them `removed` → `delete_book` destroyed their chunks; a later `gc` then purged the now-orphaned embeddings. The background worker was never the cause — its idle-scan only ever *adds*, never deletes.
+
+- **Mass-removal circuit breaker** in `sync()`: refuses a removal batch that is both large (≥ `REMOVE_CIRCUIT_MIN_FILES`, default 25) **and** a big fraction of the corpus (≥ `REMOVE_CIRCUIT_RATIO`, default 25%) — the signature of an incomplete scan, not real deletions. Index left intact; a warning is surfaced. Override with `rtfm sync --force-remove` (or `force_remove=True`) for deliberate bulk deletes.
+- **File-list mode never deletes**: when `sync(files=[...])` is given a partial list, files not in that list are no longer treated as removed (their absence from a partial list is not evidence of deletion).
+
+### Changed — lightweight hooks: the worker does the work
+
+The Claude Code hooks no longer run a full `sync()` (which re-MD5'd the entire corpus on every prompt — slow on NTFS, and the trigger for the data-loss bug above). New design:
+
+- **UserPromptSubmit / Stop** → only revive the background worker if it died. No scan, no hashing, nothing on the user's hot path.
+- **PostToolUse (Write\|Edit\|MultiEdit)** → enqueue *the one file* the agent just wrote as a P1 ingest job (mapped to its source/corpus, gated on a registered parser). Non-destructive: only ever adds work.
+- Discovery of new/changed/moved files across all sources is the worker's non-destructive idle-scan. New `install_hook` registers all three; re-running is idempotent.
+
+## [0.15.0] — 2026-05-21
+
+### Changed — OCR: tesseract backend by default, split into page tranches
+
+marker (Surya models) is excellent but unusable for OCR on CPU: on a real corpus every big scan (Narmour 499p, Eco 253p, Chomsky…) either **timed out at 20 min or OOM-crashed** during layout. New default OCR path:
+
+- **`extract_with_tesseract`** — renders each page via pypdfium2 (already a dep) and OCRs it with tesseract (fast C binary, no multi-GB ML models → no OOM/timeout). Multilingual (eng, fra, + indic packs). Languages auto-filtered to those actually installed.
+- **Page-range splitting** — a scanned book is OCR'd in tranches of `PAGES_PER_OCR_JOB = 50`, one P3 job each. A 600-page book becomes ~12 short, independently-resumable jobs instead of one hour-long block that monopolises the worker. `enqueue_ocr_jobs()` does the split; P1, `rtfm doctor --enqueue-ocr` and `backfill-pages --enqueue-ocr` all use it.
+- **Idempotent append** — `Library.append_ocr_chunks(book_slug, chunks, page_lo, page_hi)` deletes that page range then inserts, so re-running a tranche (retry) never duplicates and other tranches stay intact. Each tranche enqueues P2 embedding for just its new chunks.
+- **Config**: `ocr_backend` (`tesseract` default | `marker` | `auto`), `ocr_langs` (default `eng+fra`; set e.g. `eng+fra+tam+hin+san` for Indic-script scans).
+- New `[ocr]` extra: `pytesseract`, `pypdfium2`, `Pillow` (+ the system `tesseract` binary).
+- `pages_to_chunks()` extracted from `PDFParser.parse` and shared with the OCR handler so OCR'd pages produce identical chunk shapes. 6 new tests (split ranges, idempotent tranche append).
+
+Trade-off: tesseract is excellent on clean print (your scanned books) but weaker than marker on heavy maths/tables/multi-column. For making text searchable it's the right call on a GPU-less machine; marker stays available via `ocr_backend: marker`.
+
+## [0.14.1] — 2026-05-21
+
+### Fixed
+- `rtfm.core.embeddings` no longer hard-imports numpy at module load. numpy is part of the `[embeddings]` extra, but `reconcile()` (and the queue handlers) need only the metadata helpers (`resolve_model`, `DEFAULT_MODEL`) — which don't touch numpy. The top-level `import numpy` made `test_reconcile` fail in the core/dev CI matrix (`ModuleNotFoundError: numpy`). numpy is now imported lazily inside the functions that use it, with `from __future__ import annotations` keeping the `np.ndarray` type hints from evaluating at import time.
+
+## [0.14.0] — 2026-05-21
+
+### Fixed — embeddings no longer leak when chunks are deleted
+
+`Library._get_conn` now sets `PRAGMA foreign_keys = ON`. SQLite has FK enforcement **off by default**, so the `chunk_embeddings → chunks` `ON DELETE CASCADE` never fired: every re-ingest/`delete_book` left the old embeddings behind as orphans (a real index had **197k orphans = 19%** of all embeddings). They didn't pollute search (the semantic query JOINs on `chunks`, excluding them) but wasted disk. With FKs on, deleting a chunk removes its embedding.
+
+### Added — self-healing reconciliation (`rtfm gc` + idle worker pass)
+
+A live pipeline is never perfectly consistent (interrupted syncs, re-ingests, moves). Rather than try to prevent every gap, RTFM now **reconciles** the index periodically:
+
+- `rtfm.core.reconcile.reconcile()` — purges orphan embeddings and re-queues every chunk missing an embedding as P2 jobs.
+- **The worker runs it automatically while idle** (every `RECONCILE_INTERVAL_SECONDS = 3600`, only when the queue is empty — so it never races an in-flight re-ingest/move, and an orphan only ever means "chunk gone for good" since `move_file` preserves chunk ids).
+- **`rtfm gc [--vacuum] [--force]`** — manual trigger. Refuses while the worker is busy (reconciliation is only safe at rest); `--force` overrides; `--vacuum` reclaims disk after purging.
+
+This also surfaces and self-heals **un-embedded chunks** — content that exists but was never embedded (e.g. after an inline/`--no-embeddings` sync), so it's invisible to semantic search until reconciled. 5 new tests in `test_reconcile.py`, incl. a regression that FK=ON cascades the delete.
+
+## [0.13.0] — 2026-05-21
+
+### Fixed — half the supported formats were never scanned
+
+`DEFAULT_EXTENSIONS` was a hand-maintained list of 27 extensions that omitted **27 formats RTFM has a parser for**: csv, tsv, xlsx, sqlite, sqlite3, db, epub, mobi, azw, azw3, docx, odt, rtf, fb2, djvu, ipynb, sql, and several languages (kotlin, swift, lua, r, perl, scala, …). Those files were silently ignored unless a source declared `extensions` explicitly. `DEFAULT_EXTENSIONS` is now **derived from the parser registry** (`default_extensions()`), so every format with a parser is scanned — 56 extensions, and any newly-added parser is picked up automatically.
+
+### Added — `rtfm reindex` (targeted refresh after a parser change)
+
+When a parser is improved (e.g. the 0.12.0 tabular fix), the affected files need re-ingesting — but their content hash is unchanged, so `rtfm sync` skips them and `--force` would re-ingest *everything* (including a thousand PDFs mid-embed). `rtfm reindex` enqueues P1 ingest jobs **only** for a chosen category, leaving the rest of the queue and in-flight embeddings untouched:
+
+```
+rtfm reindex --ext csv,tsv,xlsx,sqlite,db   # after a tabular parser fix
+rtfm reindex --parser csv                   # by parser name
+rtfm reindex --ext pdf --corpus icm-bibliography
+```
+
+P1 jobs preempt pending P2/P3, so the refresh runs first. This is the "nominal" way to roll out a parser change to an existing index.
+
+## [0.12.0] — 2026-05-21
+
+### Changed — tabular parsers index the **whole** file, not a sample
+
+CSV/TSV, XLSX and SQLite were *samplers*, not parsers: they indexed only the header + a handful of rows (CSV 8, XLSX 6, SQLite 5). A value on row 5000 was invisible to search. They now index **every row**, so the full table is searchable.
+
+- **CSV/TSV** (`csv_parser.py`): overview chunk (columns + inferred types) then **all rows** in size-bounded data chunks. Each row rendered as `col=value | col=value` (every value tied to its column for FTS/semantic match), full values (no more 80-char cell truncation), header repeated per chunk. Streamed — memory stays bounded on million-row files.
+- **XLSX** (`xlsx.py`): same treatment per sheet — schema chunk + all-rows data chunks, via `read_only` `iter_rows`.
+- **SQLite** (`sqlite_parser.py`): per table, schema chunk + all rows streamed with `fetchmany(500)`. BLOB columns keep a `<blob NB>` placeholder (binary, not text-searchable); text/numeric values kept in full. FK edges unchanged.
+
+Type inference still samples the first ~50 rows (it doesn't need the whole file). Trade-off: indexing a large table produces many more chunks → bigger index and more embeddings, which is the cost of "everything searchable". Tests updated/added across all three parsers (full-content, column-context, large-file, no-truncation).
+
+## [0.11.2] — 2026-05-20
+
+### Changed — PDF health scan hardened for unattended corpus runs
+
+A cross-team freeze post-mortem (a sibling tool ran two poppler-based PDF scanners in parallel on a DrvFs/9p mount; corrupt files wedged `pdfinfo` in uninterruptible D-state, full-document `pdftotext` on big healthy PDFs saturated I/O) drove three hardening changes so RTFM can scan an entire corpus in the background without freezing WSL:
+
+- **Page sampling**: `measure_pdf_text(path, sample_pages=10)` now text-extracts only the first ~10 pages. The scan signal (≈0 chars/page) is unambiguous there; extracting a 700-page book in full was pure I/O waste. Verdict unchanged, ~10× faster per large file (Narmour 499p: 0.5 s vs seconds).
+- **Buffer read**: the file bytes are read in Python (`path.read_bytes()`, an interruptible syscall we own) and handed to pypdfium2 as a buffer, instead of letting pdfium open the path and block on the slow mount. RTFM was already subprocess-free (pypdfium2 in-process), so it never had the D-state child problem in the first place.
+- **No two scanners at once**: `rtfm doctor` refuses to run while the worker is `busy` (use `--force` to override, or stop the worker). One PDF scanner per mount.
+
+`measure_pdf_text` now also returns `sampled_pages`. `backfill-pages` no longer overwrites `total_chars` (the sampled count isn't the document total) — it writes `page_count` and bases the scan verdict on the freshly-sampled real text.
+
+## [0.11.1] — 2026-05-20
+
+### Fixed — scan detection reads the file, not the DB
+
+A cross-check against a hand-curated 28-PDF list exposed a flaw: scan detection (and `backfill-pages`) computed chars/page from the **stored** `books.total_chars`, which can be stale (different file revision, prior OCR run). It made a genuine 0-char scan (Chomsky 1957) look like text. Now the density is measured from the real file every time.
+
+- `parsers.pdf.measure_pdf_text(path)` — opens via pypdfium2, extracts the real text of every page, returns `{pages, chars, chars_per_page, error}`. A non-None `error` is a distinct "unreadable" state (pdfium "Data format error" on corrupt files) — such files can't be OCR'd by marker either (same backend), so they need re-acquisition, not OCR.
+- `backfill-pages` rewrites both `page_count` **and** a freshly-measured `total_chars`, and only flags readable scans.
+
+### Added — format sniffing + `rtfm doctor`
+
+- `core.sniff.detect_real_format(path)` — magic-byte detection (pdf / zip / epub / docx / xlsx / pptx / html / rtf / gzip / empty). Catches files saved with a lying extension (e.g. an EPUB named `.pdf`).
+- The P1 ingest handler no longer queues OCR for a `.pdf` that isn't really a PDF (marker would fail too).
+- **New `rtfm doctor`** — diagnoses every indexed PDF into ok / scan / unreadable / wrong-format / missing by reading the real file. Flags: `--enqueue-ocr` (queue P3 for readable scans), `--fix-extensions` (rename mislabeled files on disk so a re-sync routes them to the right parser).
+- 11 new tests in `test_sniff.py`.
+
+## [0.11.0] — 2026-05-20
+
+### Added — deterministic scanned-PDF detection
+
+The "is this PDF a scan that needs OCR?" decision is now based on **text density (chars per page)**, not the chunk count. On a real corpus the chunk-count heuristic was badly wrong: of 143 low-chunk PDF candidates, only **4 were actual scans** — the other ~113 had plenty of text that the chunker had merged into 1-2 large chunks. Conversely, scans that produced 1-2 junk chunks slipped past the old `chunks == 0` test entirely.
+
+- `PDFParser.parse()` writes the real `pypdfium2` page count into the shared metadata dict, so `Library._index_chunks` persists it to the new use of `books.page_count`.
+- `Library._index_chunks` returns `pages` in its stats and stores `page_count` (via `COALESCE`, so a re-ingest never nulls it).
+- `handlers._pdf_is_scan(stats)` — deterministic test: `chars / pages < SCAN_CHARS_PER_PAGE` (20). Falls back to the zero-chunk signal only when no page count is available. The P1 ingest handler uses it to decide whether to enqueue a P3 OCR job.
+- **New `rtfm backfill-pages [--enqueue-ocr]`** — fills `books.page_count` for already-indexed PDFs (cheap: pypdfium2 page count, no text extraction), reports which are provably scans, and optionally enqueues P3 OCR jobs for them (enabling `ocr_fallback` if needed).
+- 4 new tests in `rtfm/tests/test_handlers.py`.
+
+## [0.10.6] — 2026-05-19
+
+### Fixed
+- `rtfm sync` no longer crashes with `database is locked` when the Library connection has an open implicit transaction at the moment the Queue tries `BEGIN IMMEDIATE`. Two connections to the same SQLite DB **from the same Python process** see each other as locked even in WAL mode — `busy_timeout` doesn't help in that intra-process case. `_cmd_sync_enqueue` now commits the Library connection right before every batch enqueue.
+
+## [0.10.5] — 2026-05-19
+
+### Fixed
+- `Queue.enqueue_many` wraps each batch in a single `BEGIN IMMEDIATE` transaction (was N individual auto-commits) and retries up to 3× on transient `database is locked`. `busy_timeout` bumped from 10 s → 60 s for multi-MCP-server setups (3+ Claude Code sessions on the same project).
+
+## [0.10.4] — 2026-05-19
+
+### Changed — single consumer process + MD5 enqueue
+
+Two corrections to the 0.10.3 design after a real-world run on the user's musicology-phd project.
+
+- **`rtfm sync` enqueue now uses `compute_diff` (MD5)**, not `quick_diff` (size + mtime). On a 4400-job sample the previous quick-diff path was ~14 % waste: ~10 % cross-corpus duplicates (a file already in the DB under another corpus with the same MD5) and ~4 % mtime false-positives (NTFS-via-WSL re-touching files without content change). Quick-diff missed the cross-corpus case entirely.
+- **Cross-corpus moves are now applied inline** during `rtfm sync`, before any enqueue, via `Library.move_file(new_corpus=...)`. The book row's corpus is updated and its chunks / embeddings / tags follow (FK on chunk_id, not on the on-disk path). This is the work-preservation guarantee the user asked for: a file moved between configured corpora keeps the embeddings already paid for.
+
+### Changed — one process, no more watcher
+
+`rtfm/core/watcher.py` and `rtfm/tests/test_watcher.py` are gone. The periodic scan is folded into the worker idle loop: when the priority queue is empty, the worker runs the same MD5-based scan + cross-corpus move logic itself, then sleeps. One project = one process, exactly as the user originally specified.
+
+- New `--scan-interval SECONDS` option on `rtfm worker start` (default 30 s). The worker reads it via `rtfm worker-daemon --scan-interval`.
+- `rtfm watch [start|stop|status]` and `watch-daemon` are removed.
+- `rtfm status` keeps showing the `Worker / Queue:` section unchanged — it was already worker-only.
+
+The 0.10.3 watcher made sense in isolation but doubled the daemon footprint for no benefit: scanning is cheap (`quick_diff` had been ~ms per file; `compute_diff` is the new cost and only runs while the queue is empty, so a long ingest or OCR run is never paused to scan).
+
+## [0.10.3] — 2026-05-19
+
+### Added — filesystem watcher + enriched status (queue phase 4)
+
+- **`rtfm watch [start|stop|status]`** — a polling daemon that scans every configured source every 30 s (configurable via `--poll`) and enqueues P1 ingest jobs for new/modified files. Auto-spawns the worker after each scan that found something. Held by an exclusive `flock` on `.rtfm/watcher.lock` (one watcher per project), with `.rtfm/watcher_state.json` for status. Combined with the worker, a file you save now lands in the index within ~30 s, automatically, without any manual `rtfm sync`.
+- Polling (not inotify) chosen on purpose: RTFM frequently indexes Obsidian vaults on `/mnt/d/…` (NTFS via WSL), where inotify does not propagate events. The poll uses `quick_diff` (size + mtime, no MD5), so a 30 s tick is cheap even on huge corpora.
+- **`rtfm status` shows a new `Worker / Queue:` section** when relevant: worker status (running/idle/busy), current job preview, per-type counts (`ingest`, `embed`, `ocr`) with `pending/running/done/failed` breakdown. Silent on projects that never used the queue path.
+- New module `rtfm/core/watcher.py` (`Watcher`, `WatcherLock`, `watcher_running`, state primitives). `cli_worker.ensure_watcher_running()` mirrors `ensure_worker_running()`. 10 new unit tests in `rtfm/tests/test_watcher.py`.
+
+Phase 4 closes the queue redesign loop: producers (CLI, hooks, **watcher**) → priority queue → worker (one process, three priorities, bounded resources). From here on the user can edit a file and the index catches up on its own.
+
+## [0.10.2] — 2026-05-19
+
+### Added — P3 OCR handler (queue phase 3)
+
+The OCR pass is now a P3 job in the unified worker. Pipeline:
+
+```
+P1 ingest (PDF, ocr_fallback=true)
+    ├─ pdftext yields ≥1 chunk → ingest OK, enqueue P2 follow-up
+    └─ pdftext yields 0 chunks → enqueue P3 OCR for this same file
+P3 ocr
+    ├─ delete the empty book P1 left behind
+    ├─ re-ingest with PDFParser(backend="marker") — marker runs in
+    │   an isolated subprocess (0.9.5) so its 3-8 GB of model RAM
+    │   is reclaimed between PDFs
+    └─ enqueue P2 follow-up for the freshly OCR'd chunks
+```
+
+P3 sits below P1 / P2 in the queue, so a freshly-edited markdown file is always indexed before the worker burns CPU on a slow OCR run.
+
+- `handlers.handle_ocr` — P3 handler. Drops any empty book P1 left behind, re-ingests with the marker backend, updates `indexed_files`, then enqueues P2 follow-up so the OCR'd chunks reach the embedding column on their own.
+- `handlers.handle_ingest` (existing) now detects zero-chunk PDFs and auto-enqueues a P3 job *iff* `ocr_fallback: true` is set in `.rtfm/config.json`. Skips the P2 follow-up in that case (no point embedding an empty book).
+- **`rtfm sync --ocr` is queue-based by default**: persists `ocr_fallback: true` (idempotent), enqueues a P3 for every previously-flagged scan from `.rtfm/seen_scans.json`, auto-spawns the worker. The legacy detached `ocr-worker` daemon is still reachable via `rtfm sync --inline --ocr` and will be removed in 0.11.
+- 3 new tests in `rtfm/tests/test_handlers.py` (auto-enqueue P3 with fallback on; no P3 with fallback off; reject non-PDF payloads).
+
+Phase 3 closes the queue redesign the user asked for: one process, three priorities (ingest > embed > OCR), per-file granularity for responsive preemption, bounded resources (`nice 19` + `ionice -c 3` + marker subprocess isolation).
+
+## [0.10.1] — 2026-05-19
+
+### Added — P2 embed handler (queue phase 2)
+
+The priority-queue worker now drains P2 embed jobs in addition to P1 ingest. The full pipeline is:
+
+```
+producer ─► P1 ingest job ─► worker ─► parse + index + upsert tracking
+                                   ─► enqueue N P2 jobs (chunks of the new book,
+                                       split at EMBED_BATCH_SIZE=64)
+producer ─► P2 embed job  ─► worker ─► fastembed batch → chunk_embeddings
+```
+
+- `Library.embed_chunks_by_id(chunk_ids, model=None)` — embed a specific list of chunk ids. Skips chunks that already carry an embedding for the active model (idempotent retry). The 500-id chunked filter dodges SQLite's parameter limit even for huge backfills.
+- `Library.chunk_ids_for_book(slug)` and `Library.chunk_ids_without_embedding(corpus=None)` — small helpers used by the P1 follow-up enqueue and by `rtfm embed` in queue mode.
+- `handlers.handle_embed` — P2 handler: load `chunk_ids` from payload, call `embed_chunks_by_id`. Empty payload is a no-op (so a malformed enqueue doesn't fail the job).
+- `handlers.handle_ingest` (existing) now enqueues a P2 batch per `EMBED_BATCH_SIZE=64` chunks of the newly-created book — chunks reach the embedding column on their own, no manual `rtfm embed` needed.
+- **`rtfm embed` is queue-based by default**: scans for chunks missing an embedding, splits at `EMBED_BATCH_SIZE`, enqueues P2 jobs, auto-spawns the worker, returns immediately. `--inline` and `--force` keep the legacy blocking path (CI / re-embedding the whole DB).
+- 5 new tests in `rtfm/tests/test_handlers.py`. Fixed an `INSERT … ON CONFLICT(chunk_id, model)` clause to match the table's actual `UNIQUE(chunk_id)` constraint.
+
+### Coming
+
+Phase 3 (P3 OCR handler — folds the existing OCR daemon into the unified worker) lands in 0.10.2.
+
+## [0.10.0] — 2026-05-19
+
+### Added — priority-queue worker (MVP / phase 1)
+
+The work model moves from "every command blocks on a full-tree sync" to a single in-project background daemon that drains a priority queue. Producers (CLI, hooks, MCP tools) enqueue per-file jobs; the worker picks them up by priority. Ingestion (P1) preempts embeddings (P2) which preempts OCR (P3), so a file you just edited is indexed before any embedding/OCR backlog. Granularity is one file per job, so preemption is responsive (next-job boundary).
+
+- New `work_queue` table in `.rtfm/library.db` with priority + status + dedup index on `(type, payload) WHERE status='pending'` — multiple producers can safely enqueue concurrently.
+- `rtfm.core.queue.Queue` — atomic `enqueue` / `dequeue` (single-statement `UPDATE ... RETURNING`), `mark_done` / `mark_failed`, `stats` / `list_pending` / `list_failed`, `retry_failed`, `clear_done`. 13 unit tests.
+- `rtfm.core.worker.Worker` — single-threaded loop, dispatch by job type, atomic state snapshot to `.rtfm/worker_state.json`, exclusive `flock` on `.rtfm/worker.lock` so at most one worker drains a project at a time.
+- `rtfm.core.handlers.handle_ingest` — P1 worker handler. Equivalent to the per-file path of the legacy inline sync (parse → ingest → upsert tracking), but isolated to a single file.
+- **`rtfm sync` is now queue-based by default**: scans configured sources, enqueues P1 jobs for new/modified files, auto-spawns the worker daemon (at `nice 19` + `ionice -c 3` when available), returns immediately. `--inline` keeps the legacy blocking sync for CI / scripted use; `--ocr`, `--no-embeddings`, `--files`, explicit path, `--dry-run`, `--force` also stay on the legacy path.
+- **New CLI commands**:
+  - `rtfm worker [start|stop|status]` — manage the daemon directly.
+  - `rtfm worker-daemon` — hidden; the actual loop, invoked by `ensure_worker_running()`.
+  - `rtfm queue [stats|list|failed|clear-done|retry-failed]` — inspect & manage the queue (`--limit`, `--keep`).
+
+### Coming
+
+Phase 2 (P2 embed handler — chunks-without-embeddings as scheduled jobs) and Phase 3 (P3 OCR handler — folds the existing OCR daemon into the unified worker) will land in 0.10.1 / 0.10.2.
+
+## [0.9.5] — 2026-05-18
+
+### Fixed
+- **OCR no longer accumulates RAM across PDFs.** `marker.models.create_model_dict()` loads 3-8 GB of ML state (layout + OCR + table + reading-order pipelines) and caches it at module level — marker never releases it. The old in-process loop in `extract_with_marker()` re-loaded those models for every PDF without freeing the previous run, so a long `rtfm sync --ocr` on WSL (16 GB cap) climbed past the ceiling, swapped on NTFS, and froze the whole VM. Now each PDF is OCR'd in a one-shot Python subprocess (`subprocess.run`); the OS reclaims the full footprint when the child exits. Adds a 20-min per-PDF timeout (`PDFExtractionError` instead of an indefinite hang) and a structured JSON protocol between worker and host. 3 new tests in `rtfm/tests/test_pdf_parser.py`.
+
+## [0.9.4] — 2026-05-18
+
+### Changed
+- **Claude Code hooks: targeted per-turn sync instead of full-tree rescan.** Before 0.9.4 the `UserPromptSubmit` and `Stop` hooks both iterated every configured source (e.g. 35 sources for a multi-vault project) at every turn — ~30–60s per hook, fighting an `rtfm sync --ocr` daemon for SQLite write locks on multi-session setups and producing 100+ redundant scans per hour. The new design is event-driven:
+  - New `PostToolUse` hook (`rtfm_record_edit.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) appends each touched `file_path` to `.rtfm/touched_files.tmp` in O(1).
+  - `Stop` (`rtfm_stop_sync.py`) reads that queue, groups files by their longest-matching configured source, and runs `sync(files=[...])` only for those files. Empty queue → instant no-op.
+  - `UserPromptSubmit` (`rtfm_sync.py`) is now just a safety-net drain for orphan queues left behind by sessions abandoned before their Stop hook ran.
+- Net effect: zero-cost hooks on turns with no edits; sub-second sync on turns with 1–5 edits; never re-scans untouched sources; no more lock contention with the OCR daemon. `hooks.json` updated to register `PostToolUse`.
+
+## [0.9.3] — 2026-05-18
+
+### Fixed
+- **Sync no longer drops embeddings with `Model paraphrase-multilingual-MiniLM-L12-v2 is not supported in TextEmbedding`** on DBs created by older RTFM versions. Early releases stored the short, unqualified model name (`paraphrase-multilingual-MiniLM-L12-v2`) in `chunk_embeddings.model`. Recent fastembed releases only accept the fully-qualified `sentence-transformers/...` form, so reusing the DB's active model on a fresh sync threw mid-batch and silently disabled embedding generation for every new chunk. `resolve_model()` now suffix-matches a short name back to the registered fully-qualified entry, and `Library.generate_embeddings()` normalizes the DB-stored name through `resolve_model` before handing it to fastembed. 4 new tests in `rtfm/tests/test_embeddings.py::TestResolveModel`.
+
+## [0.9.2] — 2026-05-18
+
+### Fixed
+- **`move_file()` no longer crashes with `UNIQUE constraint failed: indexed_files.filepath`.** Previously the cross-corpus move pass did a plain `DELETE + INSERT` on the tracking table, which raised mid-sync as soon as the target `filepath` already had a row (typical when only the corpus name changes in `config.json` and every cross-move has `old_filepath == new_filepath`). The DELETE had already run when the INSERT threw, so the `books` row was repointed at the new corpus but its tracking entry was gone — leaving thousands of "orphan" books with no `indexed_files` mapping. Replaced with an `INSERT ... ON CONFLICT(filepath) DO UPDATE` (same pattern as `update_indexed_file`) and an explicit `DELETE old_filepath` only when it differs from `new_filepath`. 2 new regression tests in `rtfm/tests/test_cross_corpus_move.py` (`test_corpus_rename_in_place_no_unique_conflict` reproduces the user-facing scenario; `test_move_file_preexisting_target_filepath` is a belt-and-braces unit test). Full suite: 501 passed.
+
+## [0.9.1] — 2026-05-18
+
+### Fixed
+- **MCP tools now coerce numeric params passed as strings.** Some MCP clients/LLMs emit `"limit": "5"` instead of `"limit": 5`; downstream comparisons like `len(results) >= limit` in `library.search()` then crashed with `TypeError: '>=' not supported between instances of 'int' and 'str'`. Affected `rtfm_search`, `rtfm_context`, `rtfm_books`, `rtfm_expand`, and `rtfm_history`. New `_coerce_int`/`_coerce_float` helpers in `rtfm/mcp.py` cast incoming values, fall back to the documented default on unparseable input, and reject `bool` (which is a subclass of `int` in Python). 9 new regression tests in `rtfm/tests/test_mcp.py`. Full suite: 487 passed.
+
+## [0.9.0] — 2026-05-18
+
+### Added
+- **`rtfm sync --ocr` runs as a detached background daemon.** Marker-based OCR takes minutes per scanned PDF, hours for a real corpus — the previous foreground implementation died with the terminal or the Claude Code hook timeout, losing the entire run. The command now: (1) refuses to relaunch if another daemon is already running (shows live progress and PID instead), (2) persists `ocr_fallback: true` in `.rtfm/config.json`, (3) invalidates the hash of every PDF in `.rtfm/seen_scans.json` so the worker's incremental sync re-ingests them, (4) forks a `subprocess.Popen(..., start_new_session=True)` worker (immune to parent SIGHUP) and exits immediately with the daemon's PID. New internal `rtfm ocr-worker` subcommand does the actual sync.
+- **Resumable**: the worker writes its live state to `.rtfm/ocr_state.json` (atomic temp+rename) with `pid`, `status`, `total`, `done`, `current_file`, `started_at`, `last_update`. If the daemon is killed mid-run, the next `rtfm sync --ocr` resumes from where the incremental sync left off — files already OCR'd have a real hash and are skipped.
+- **`rtfm status` now surfaces the OCR daemon** when one is present:
+  - Live: `OCR running (PID 12345): 23/156 PDFs (15%), 1h20m elapsed, ETA ~6h\n  current: scan_45.pdf`
+  - Dead-but-resumable: `OCR interrupted at 23/156 (...). Resume: rtfm sync --ocr`
+- `/rtfm.status` and `/rtfm.ocr` slash command prompts updated to highlight the daemon state and never wait/poll.
+- New module `rtfm/core/ocr_daemon.py` exposes the helpers (`pid_alive`, `read_state`, `write_state`, `daemon_running`, `format_progress`) and the on-disk `ocr_state.json` schema.
+- 14 new unit tests in `rtfm/tests/test_ocr_daemon.py` cover PID liveness, atomic write semantics, the running-detection logic, malformed-JSON tolerance, and the progress renderer for running/crashed states. Full suite: 475 passed.
+
+### Changed
+- `rtfm sync --ocr` no longer accepts running in the foreground. (If you really need a foreground run for debugging, invoke `rtfm ocr-worker` directly — it's hidden from `--help` but documented in `rtfm/core/ocr_daemon.py`.)
+
+## [0.8.9] — 2026-05-18
+
+### Added
+- **Cross-corpus move detection by content hash.** When a file is reorganised across corpus boundaries (e.g. moved from an Obsidian `Projets/` into `Publications/` when those map to different RTFM corpora), `compute_diff()` now spots the hash match against `library.list_indexed_files()` (all corpora) and transfers ownership instead of treating the file as deleted-in-A + added-in-B. The book row is updated in place, so chunks, **embeddings, and tags all survive** (they reference `chunk_id`, not the on-disk path). Critical when expensive computation has already been done — semantic embeddings, OCR output, manual tagging.
+- `library.move_file(..., new_corpus=...)` is the new entry point. The same on-disk filepath cannot belong to two corpora at once (table constraint), so this is also a safe partition guarantee.
+- 3 new tests in `rtfm/tests/test_cross_corpus_move.py` covering chunk-id preservation across the move, regression on in-corpus moves, and the "really new file" path. Full suite: 461 passed.
+
+## [0.8.8] — 2026-05-18
+
+### Added
+- **`/rtfm.status` slash command.** Wraps `rtfm status --health` so the user can check index health from the Claude Code `/` menu without dropping to a terminal. Returns the full status (books, chunks, corpora, embeddings, last sync, parsers, extras) plus pending-sync counts and known scan suspects. Defined in `commands/rtfm.status.md`.
+
+## [0.8.7] — 2026-05-17
+
+### Fixed
+- **Slash command moved to the correct location and renamed to `/rtfm.ocr`.** In 0.8.6 the file lived at `.claude-plugin/commands/ocr.md`, which is not a directory scanned by Claude Code — plugin slash commands must sit in `commands/` at the plugin root (per the official Plugins reference). Renamed to `commands/rtfm.ocr.md`, so the command surfaces as `/rtfm.ocr` in the slash menu once the marketplace plugin is updated (`/plugin marketplace update roomi-fields` then reinstall `rtfm@roomi-fields`).
+
+## [0.8.6] — 2026-05-17
+
+### Added
+- **`/rtfm:ocr` slash command.** Users who install RTFM via `/plugin install rtfm@roomi-fields` now get a Claude Code slash command that wraps `rtfm sync --ocr` — pick it from the `/` menu, the agent runs the command, summarises results, and confirms persistent OCR fallback is active. Defined in `.claude-plugin/commands/ocr.md`.
+
+### Fixed
+- **`rtfm sync --ocr` now works from any directory.** When invoked outside a `.rtfm/` project (no config to persist into), the flag still forces `ocr_fallback=True` for the current run. Previously it was silently ignored: the persistent flag could only be saved when a `.rtfm/` was reachable, and the run itself fell back to pdftext-only.
+
+## [0.8.5] — 2026-05-17
+
+### Added
+- **One-shot `rtfm sync --ocr` — persistent OCR fallback for scanned PDFs.** Activates an `ocr_fallback: true` flag in `.rtfm/config.json` and re-runs sync with `force=True` so previously-empty scans get OCR'd immediately. From then on, every sync (CLI or auto via hook) instantiates `PDFParser(backend='auto')` for PDFs: it tries `pdftext` first (fast, ~ms) and only falls back to `marker-pdf` (slow OCR) when no text was extractable. **The user runs the command once** — new scans added to indexed sources are OCR'd automatically by the next sync. Successfully OCR'd files drop off `.rtfm/seen_scans.json` so `rtfm status` reflects the real remaining backlog.
+- **`PDFParser` gains a `backend='auto'` mode** that does the pdftext → marker fallback in-process. Existing `pdftext` and `marker` modes are unchanged. Picks the cheap backend by default; only spends OCR cycles on real scans.
+- **Periodic progress reporting inside `sync()`.** New `progress_interval` parameter (seconds) emits a heartbeat line via `on_progress("progress", "", "K/N files, Xmin elapsed, ~Ymin remaining")` while the inner loop runs. CLI auto-enables a 10-minute interval when `--ocr` is set; `--progress-every N` overrides. Long OCR passes no longer look frozen.
+- **`ACTION REQUIRED` blocks now propose a concrete copy-pastable command.** Both the MCP `rtfm_sync` tool and the auto-sync hook print `ON APPROVAL RUN: rtfm sync --ocr` (instead of the previous "install [pdf] and re-sync" phrasing) and explicitly tell the user that the command is one-shot — future scans are handled automatically.
+
+### Changed
+- The hook (UserPromptSubmit + Stop) reads `ocr_fallback` from `.rtfm/config.json` and propagates it to the inner `sync()` call, so the auto-sync respects the persistent flag.
+- `_print_health_warnings()` now adapts its message: when OCR fallback is already on but scans still survive, it tells the user the PDFs are likely corrupt rather than re-suggesting OCR.
+
+## [0.8.4] — 2026-05-17
+
+### Fixed
+- **`rtfm status` and the auto-sync hook no longer block on remote/NTFS sources.** 0.8.3 reduced the status-health diff from "hash every file" to "stat every file"; on a small local repo that's instant, but on a 1700-file Obsidian vault sitting on NTFS via WSL even `os.stat()` adds up to ~90 seconds per source. Two changes:
+  - `rtfm status` now keeps the index-health pending counts behind an opt-in `--health` flag. The default `rtfm status` runs in well under a second again, and known scan suspects (a single JSON read) are still shown unconditionally.
+  - The `UserPromptSubmit` hook bounds its pre-sync diff to a 2-second total budget. If the budget is exhausted before all sources are scanned, the "indexing N files" announcement is silently skipped and the actual sync proceeds normally — the post-sync `✓ RTFM sync` summary still fires.
+
+## [0.8.3] — 2026-05-17
+
+### Fixed
+- **`rtfm status` no longer hangs on large corpora.** The "Index health" section introduced in 0.8.1 ran `sync(..., dry_run=True)` for every configured source, which computes the MD5 of every tracked file — fine on a small repo, but a hard wait on corpora with hundreds of large PDFs (e.g. research libraries). Replaced by a new `quick_diff()` helper in `rtfm/core/sync.py` that compares path presence + on-disk `st_size` against the stored tracking metadata. The same helper now also feeds the `UserPromptSubmit` hook's "indexing N files" announcement. Trade-off: an in-place edit that does not change the file size can be missed by `quick_diff`; the real `rtfm sync` still uses the hash diff for correctness.
+- Tests: 3 new in `rtfm/tests/test_sync_health.py` covering the added / modified-by-size / removed paths of `quick_diff`.
+
+## [0.8.2] — 2026-05-17
+
+### Fixed
+- **`rtfm.__version__` no longer reports `"0.0.0"` to installed users.** `rtfm/__init__.py` was looking up `importlib.metadata.version("rtfm")` but the distribution name on PyPI is `rtfm-ai` (the `rtfm` import name was already taken by an unrelated package). The lookup raised `PackageNotFoundError` silently and fell back to `"0.0.0"`, which leaked into every place that reads `__version__` — the CLI, the MCP server stats output, and `rtfm status`. Now uses `version("rtfm-ai")` and adds a regression test (`rtfm/tests/test_version.py`) that fails if `__version__` drifts from `pyproject.toml`.
+
+## [0.8.1] — 2026-05-17
+
+### Added
+- **Sync health signals — RTFM no longer swallows scanned PDFs silently.** `SyncResult` now exposes `suspect_scans` (PDFs that parsed without error but produced 0 chunks — almost always image-only scans needing OCR) and `empty_files` (other 0-chunk parses). The CLI, MCP server and the auto-sync hook all surface this state instead of silently treating it as a successful sync.
+  - `rtfm sync` (CLI) prints a localized warning block listing the suspect PDFs and the OCR install path.
+  - `rtfm_sync` (MCP) emits an `ACTION REQUIRED — surface to the user verbatim` block, the same format used when the `pdf` extra is missing, so the agent raises it with the user instead of moving on.
+  - `UserPromptSubmit` hook dry-runs the diff first; announces `→ RTFM: indexing N files...` when there are ≥ 50 new/modified files, prints `✓ RTFM sync: +A ~M -R files (Xs)` when something actually changed, and forwards new scan warnings as the same `ACTION REQUIRED` block. Already-reported scans are tracked in `.rtfm/seen_scans.json` so the warning does not repeat on every turn.
+- **`rtfm status` — new "Index health" section.** Reports pending added / modified / removed files relative to the configured sources (best-effort dry-run) and known scan suspects. Answers the question "is my index up to date?" in one command.
+- Tests: 9 new in `rtfm/tests/test_sync_health.py` covering `SyncResult` shape, sync-time classification, the CLI warning helper, and the MCP `ACTION REQUIRED` block. Full suite: 448 passed, 17 skipped.
+
+## [0.8.0] — 2026-05-16
+
+### Added
+- **7 new document parsers — ebook and office formats.** RTFM now indexes EPUB, MOBI/AZW/AZW3, FB2, DJVU, DOCX, ODT, and RTF in addition to the existing 15 formats.
+  - `epub` (extra `[epub]`: `ebooklib`, `beautifulsoup4`) — walks the spine in reading order, one chunk group per chapter, OPF title/author lifted into metadata.
+  - `mobi_parser` (extra `[mobi]`: `mobi`, `beautifulsoup4`) — Kindle MOBI/AZW/AZW3, DRM-free only; DRM-protected files surface a clean `MOBIExtractionError`.
+  - `fb2` — FictionBook XML, zero external dependency (stdlib `xml.etree`). Sections become chapters, `<title-info>` becomes title/author.
+  - `djvu` — DJVU via the `djvutxt` system binary from `djvulibre-bin` (no Python dep), one chunk group per page.
+  - `docx` (extra `[office]`: `python-docx`, `odfpy`, `striprtf`) — paragraphs walked in document order, Heading 1/2/3 styles cut sections, tables flattened to `cell | cell`. `core_properties.title/author` lifted into metadata.
+  - `odt` (extra `[office]`) — same shape as `docx`, sections cut by `text:h` with `text:outline-level`. Metadata via `dc:title` / `dc:creator`.
+  - `rtf` (extra `[office]`) — text-only extraction via `striprtf`; RTF has no native hierarchy so chunking is paragraph-based.
+- **Shared chunking helpers** in `rtfm/parsers/_chunking.py` (`split_into_paragraphs`, `merge_short_paragraphs`, `split_on_sentence`, `slugify`, `content_hash`, `estimate_page`). New parsers reuse these; the older `markdown.py` and `pdf.py` keep their own copies for now (no behaviour change).
+- New tests: `rtfm/tests/test_ebook_parsers.py` and `rtfm/tests/test_office_parsers.py` — fixtures synthesise minimal files in-process; tests `importorskip` cleanly when an optional dep is absent.
+
+## [0.7.2] — 2026-05-06
+
+### Fixed
+- **MCP server connection: `bin/rtfm-serve` now executable.** The shell launchers (`rtfm-serve`, `rtfm-hook`, `rtfm-install-extras`) were checked into git with mode `100644` (no exec bit) because they were authored on a WSL/NTFS filesystem that does not preserve the POSIX exec bit. Claude Code clones plugins respecting the git index modes, so on Linux/macOS the MCP server failed to start with no helpful error in the `/plugin` UI ("rtfm MCP · failed"). Index permissions are now `100755` for the three shell launchers; `.cmd` siblings keep `100644` (Windows ignores the exec bit). To receive the fix: `/plugin marketplace update roomi-fields` then `/reload-plugins`.
+
+## [0.7.1] — 2026-05-06
+
+### Changed
+- **Distribution: marketplace consolidated.** The standalone `roomi-fields/rtfm` marketplace is retired; RTFM now ships exclusively through the aggregator marketplace [`roomi-fields/claude-plugins`](https://github.com/roomi-fields/claude-plugins). Install command changes: `/plugin marketplace add roomi-fields/claude-plugins` then `/plugin install rtfm@roomi-fields`. The plugin itself is unchanged — same `bin/rtfm-serve`, same hooks, same skills. Existing users of the standalone marketplace should run `/plugin marketplace remove rtfm` and re-install via the aggregator.
+
+No code changes — the wheel is byte-identical to 0.7.0. This release exists to carry the version bump in `.claude-plugin/plugin.json` and signal the marketplace migration to PyPI users via the release feed.
+
+## [0.7.0] — 2026-05-04
+
+### Added
+- **Generic JSON schema mappings** — declaratively map any JSON schema to chunks and edges via YAML files in `.rtfm/mappings/`, no Python required. Drop a mapping file (matched by `$schema` URL or by a discriminator like `type: foo`) and matching JSON files are extracted into typed chunks at sync time. The system replaces what would otherwise be N format-specific parsers (NotebookLM exports, Linear/Jira dumps, OpenAPI specs, structured logs…) with one extensibility point that lives outside RTFM. Mini-templating engine (`{{ dotted.path }}` only — no eval, no Jinja). 35 new tests, zero new dependencies. See [docs/json-mappings.md](json-mappings.md).
+- **NotebookLM integration recipe** — [docs/notebooklm-integration.md](notebooklm-integration.md) covers both the zero-friction markdown path and the typed JSON path, with a ready-to-copy `nblm-answer.yaml` mapping for `notebooklm-mcp` batch outputs.
+
+### Changed
+- `JSONParser` consults `MappingRegistry.find_mapping(data)` before falling back to the generic structural parser. Plain JSON files are unaffected.
+- `Library.__init__` autoloads mappings from `<db_dir>/mappings/*.{yaml,yml,json}`.
+
+## [0.6.0] — 2026-05-04
+
+### Added
+- **SQLite parser** (`.sqlite`, `.sqlite3`, `.db`) — read-only URI connection. Emits an overview chunk (tables, views, indexes, triggers + row counts), then per-table schema + sample chunks. Foreign keys extracted as `EdgeCandidate(relation_type="fk")`. FTS5 shadow tables filtered. `.db` extension validated by SQLite magic bytes to avoid false positives.
+- **Jupyter parser** (`.ipynb`) — groups cells by markdown heading, code cells fenced as ```python, outputs dropped (often huge / low-signal). Zero deps.
+- **TOML parser** (`.toml`) — one chunk per top-level table; emits `depends_on` edges for `pyproject.toml` (PEP 621, Poetry, build-system) and `Cargo.toml`. Uses stdlib `tomllib` (3.11+) with `tomli` fallback; gracefully unregistered if neither importable.
+- **CSV/TSV parser** (`.csv`, `.tsv`) — dialect sniffing (delimiter), overview chunk with column types via lightweight inference (int/float/bool/text), sample chunk (first N rows aligned). Streams rows so big files don't blow memory.
+- **XLSX parser** (`.xlsx`) — per-workbook overview + per-sheet schema + per-sheet sample. Optional dependency: `pip install rtfm-ai[xlsx]` (openpyxl). Uses `read_only=True` for huge workbooks.
+
+### Changed
+- Parser count: **10 → 15**.
+- `pyproject.toml`: new optional extras `[xlsx]` (openpyxl).
+
+## [0.5.0] — 2026-04-16
+
+### Added — native Claude Code plugin
+- **`/plugin marketplace add roomi-fields/rtfm` + `/plugin install rtfm@rtfm`** — zero pip required on user side.
+- **Pure-Python MCP server** (`rtfm/_mcp/`, ~300 LOC) — drops the upstream `mcp` SDK, no `pydantic`, no `cryptography`, no native binaries. JSON-RPC 2.0 over stdio, schemas inferred from type hints + docstrings.
+- **Cross-platform launchers** (`bin/`) — POSIX `sh` + Windows `.cmd`, auto-resolve `python3`/`python`/`py`, dodge the Microsoft Store `python3` stub.
+- **Plugin hooks** — `SessionStart` bootstraps the project, `UserPromptSubmit` throttled sync (30s), `Stop` final sync.
+- **Skills** — `/rtfm:search`, `/rtfm:expand`, `/rtfm:install-embeddings` (FastEmbed ONNX ~85 MB), `/rtfm:install-pdf` (~50 MB), `/rtfm:install-pdf-full` (CPU-only torch + marker-pdf, ~1.5 GB, isolated venv in `$CLAUDE_PLUGIN_DATA`, no PEP 668 conflicts).
+
+### Fixed
+- **Short files no longer silently skipped** — single-header markdown, title-only LaTeX sections, Python modules without classes, short legal articles. Affects `markdown`, `pdf`, `python`, `latex`, `xml_legifrance`, `html_bofip`.
+- **Memory history preserved on file deletion** — `sync(retain_history=None)` no longer cascades deletes through `books.id → file_versions.book_id`. Restores the "unlimited version history" promise of the memory hook. Default (`retain_history=50`) unchanged.
+
+### Changed
+- Dropped `mcp>=1.0.0` dependency. Only `pyyaml` remains.
+- README: plugin install promoted to primary path; `pip install rtfm-ai` kept as fallback for Cursor, Codex, Claude Desktop chat, other MCP clients.
+
+## [0.4.0] — 2026-04-09
+
+### Added — Obsidian Vault Integration
+- **`rtfm vault` command** — detects Obsidian vaults (`.obsidian/`), auto-proposes corpus mappings from folder structure, generates `_rtfm/` navigation files (Obsidian-native: wikilinks, YAML frontmatter Dataview-queryable, callouts, Mermaid).
+- **Wikilink resolution** — `[[wikilinks]]` resolved to actual files following Obsidian rules (basename match case-insensitive, path-suffix `[[folder/Note]]`, disambiguation by path distance). Resolved links become graph edges → powers hub detection + centrality ranking.
+- **`_rtfm/` auto-generated navigation** — `index.md` (corpus list, top connected docs), `graph.md` (hubs, orphans, broken links, Mermaid), `recent.md` (auto-updates on sync), `corpus/*.md` (per-corpus indexes).
+- **Karpathy 3-layer repo restructure** — `raw/` (source), `docs/` (compiled wiki), `CLAUDE.md` (schema).
+- **Docs**: Obsidian Vault Guide, Architecture, Parsers Guide, Positioning.
+
+### Stats
+- 357 tests pass, 0 regressions; 32 new tests (wikilink + vault integration); 7,100+ LOC added.
+
+## [0.3.1] — 2026-03-01
+
+### Changed
+- **`rtfm_expand` reads raw file lines** — Content is now read from disk between `line_start` and `line_end`, guaranteeing line numbers match `Read`/`Edit` exactly.
+- **Strict path resolution** — `rtfm_expand` uses exact path matching instead of fuzzy slug lookup. No more ambiguous results from duplicate files.
+- **CLAUDE.md template mentions `rtfm_expand`** — Guides agents to use `rtfm_search` then `rtfm_expand` instead of defaulting to `Read`.
+- **Batch corpus resolution** — Search formatting resolves corpus paths in a single query instead of per-result SQL.
+
+### Fixed
+- **Markdown/LaTeX parser `line_start` off-by-one** — Content line numbers now point to first content line after the header.
+- **Double search removed in expand query mode** — Was falling back to unscoped search, causing irrelevant matches.
+
+### Added
+- **`count` parameter for `rtfm_expand`** — Read multiple consecutive chunks in one call.
+- **End-to-end search→expand→Edit test** — Proves line numbers from expand match the real file.
+
+## [0.3.0] — 2026-02-27
+
+### Removed
+- **biblirag dissociation** — Removed all RAG/question-answering code (`ask.py`, `llm.py`, `cmd_ask`, `Citation`, `GroundingResult`, `Answer` models). RTFM is now a pure retrieval layer.
+- **Legacy code** — Removed `src/` (biblirag legacy), `config/`, `extract.py`, `query.py`, `requirements.txt`.
+- **Gemini dependency** — No more LLM client code. RTFM indexes and retrieves; generation is the agent's job.
+
+## [0.2.3] — 2026-02-25
+
+### Fixed
+- **Dynamic version** — `__version__` now reads from `importlib.metadata` instead of hardcoded string, stays in sync with `pyproject.toml`.
+- **`rtfm_books` pagination** — MCP tool now returns per-corpus summary + paginated listing (default 50 books/page) with `limit`/`offset` params. Previously dumped all books at once (~18k tokens for large repos).
+
+## [0.2.2] — 2026-02-24
+
+### Fixed
+- **Auto-enable MCP in Claude Code settings** — `rtfm init` now adds `rtfm` to `enabledMcpjsonServers` in `.claude/settings.json` and `.claude/settings.local.json`. Previously the server was configured in `.mcp.json` but not activated, causing it to silently disappear from `/mcp`.
+- **Simplified CLAUDE.md template** — Replaced verbose 30-line workflow with concise 4-line instruction (search, Read, Edit). Less prescriptive, better agent compliance.
+- **CLI progressive disclosure** — `rtfm search` now deduplicates results by source and shows metadata-only output with absolute file paths, matching the MCP server format.
+- **Semantic search slug extraction** — Fixed slug parsing in `library.py` for semantic search results.
+
+## [0.2.0] — 2026-02-21
+
+### Added
+- **Config auto-detection** — `.rtfm/` directory found automatically (like `.git/`), no more `--db` on every command
+- **Source management** — `rtfm add`, `rtfm sources` to register directories for recurring sync
+- **Multi-source sync** — `rtfm sync` (no args) syncs all registered sources from `.rtfm/config.json`
+- **`rtfm serve`** — start MCP server directly from CLI (replaces `python -m rtfm.mcp`)
+- **`rtfm context`** / **`rtfm expand`** — CLI commands for progressive disclosure
+- **`rtfm monitor`** — tail live MCP and hook activity
+- **Progressive disclosure in MCP** — search/context return metadata-only (file paths, scores, chunk counts), expand returns full content
+- **Absolute path resolution** — search results include absolute file paths so agents can `Read()` directly
+- **End-of-content marker** — expand output ends with `⏹` to prevent "file seems truncated" false positives
+- **Dual auto-sync hooks** — UserPromptSubmit (every 30s) + Stop (final sync)
+- **Corpus-prefixed slugs** — FR/EN translations get distinct slugs (e.g. `published--b4-flags` vs `published-en--b4-flags`)
+- **Language in search results** — `lang: fr` / `lang: en` shown when available from frontmatter
+
+### Changed
+- **FTS as default search** — `rtfm_search` defaults to `search_type="fts"` instead of `"hybrid"` (avoids 6min MiniLM cold start)
+- **Data/instruction separation** — search results contain pure data (file paths, slugs, scores), no inline instructions
+- **CLAUDE.md template** — simplified: "RTFM first, then Read", "NEVER Glob for research"
+- **Hook architecture** — simplified from 4 hooks to 2 (UserPromptSubmit + Stop)
+
+### Removed
+- `rtfm_remember` tool — replaced by scratch files + auto-sync (simpler, same result)
+- Inline `rtfm_expand()` hints in search results — replaced by `file:` / `slug:` pure data fields
+
+### Performance (benchmarked on real tasks)
+- **-51% cost** vs no-RTFM ($11.14 vs $22.61)
+- **-16% duration** (6m58s vs 8m16s)
+- **-61% tokens** (3.22M vs 8.21M)
+
+## [0.1.0] — 2026-02-15
+
+### Added
+- Full-text search with SQLite FTS5 (porter stemming)
+- Semantic search with sentence embeddings (paraphrase-multilingual-MiniLM-L12-v2)
+- Hybrid search (FTS5 + semantic)
+- 10 smart parsers: Markdown, Python (AST), LaTeX, YAML, JSON, Shell, PDF, Legifrance XML, BOFiP HTML, plain text
+- MCP server with tools: rtfm_search, rtfm_context, rtfm_discover, rtfm_stats, rtfm_sync, rtfm_ingest, rtfm_tags, rtfm_books, rtfm_tag_chunks, rtfm_remove
+- `rtfm init` — one-command project setup (database, .mcp.json, CLAUDE.md, auto-sync hook, .gitignore)
+- `rtfm_context` — progressive disclosure for AI agents (lazy indexing, hybrid search)
+- `rtfm_discover` — fast project structure scan (~1 second)
+- Incremental sync with file hash tracking and corpus isolation
+- Auto-sync hook for Claude Code (UserPromptSubmit, throttled to 30s)
+- Background embedding generation in MCP server (model cached in memory)
+- Multi-corpus support for organizing documents by source
+- Tag management (manual + batch tagging)
+- Article versioning for legal documents (history, date lookup, diff)
+- CLI with search, semantic-search, stats, status, sync, init, embed, books, corpora, tags, schema commands
+- Python API (Library, SearchResults with to_dict/to_json/to_markdown/to_prompt)
+- LLM-ready exports with to_prompt() (XML-structured context)
+- `--force` flag for re-indexing all files
+- Extensible metadata (domain-specific fields stored as JSON)

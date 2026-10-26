@@ -1,0 +1,20 @@
+{
+  "name": "rtfm",
+  "description": "The open retrieval layer for AI agents — indexes code, docs, data. Search via MCP.",
+  "version": "0.55.1",
+  "author": {
+    "name": "roomi-fields"
+  },
+  "homepage": "https://github.com/roomi-fields/rtfm",
+  "repository": "https://github.com/roomi-fields/rtfm",
+  "license": "MIT",
+  "mcpServers": {
+    "rtfm": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/rtfm-serve",
+      "args": [],
+      "env": {
+        "RTFM_DB": ".rtfm/library.db"
+      }
+    }
+  }
+}

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""RTFM Stop hook — targeted incremental sync.
+
+Reads the list of files touched this turn from
+``.rtfm/touched_files.tmp`` (populated by the PostToolUse hook), groups
+them by the longest-matching configured source, and runs
+``sync(files=[...])`` for each group. Resets the list on success.
+
+Before 0.9.4 this hook re-scanned every configured source at every turn,
+which on multi-session setups with 35 sources became unbearable and
+fought the running OCR daemon for SQLite write locks.
+
+Falls back to a no-op when no files were touched this turn.
+"""
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+# Make the plugin-bundled rtfm code importable without pip.
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
+
+def _project_root() -> Path | None:
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    return Path(env).resolve() if env else None
+
+
+def _log(project_root: Path, msg: str) -> None:
+    try:
+        ts = time.strftime("%H:%M:%S")
+        log_path = project_root / ".rtfm" / "rtfm.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}]       hook | {msg}\n")
+    except Exception:
+        pass
+
+
+def _load_sources(rtfm_dir: Path, project_root: Path) -> tuple[list[dict], str]:
+    """Read sources + default_corpus from .rtfm/config.json, with project
+    root as a single-source fallback."""
+    config_path = rtfm_dir / "config.json"
+    default_corpus = "default"
+    sources: list[dict] = []
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            sources = cfg.get("sources", []) or []
+            default_corpus = cfg.get("corpus", "default")
+        except Exception:
+            pass
+    if not sources:
+        sources = [{"path": str(project_root), "corpus": default_corpus}]
+    return sources, default_corpus
+
+
+#: A drain takes the queue whole by renaming it to one of these, so lines
+#: the edit hook appends meanwhile land in a fresh queue and are not lost.
+#: One left behind is a drain that was cut short — the next one takes it.
+CLAIMED_GLOB = "touched_files.*.draining"
+
+
+def pending(rtfm_dir: Path) -> bool:
+    """Whether anything waits to be drained: the queue, or a cut drain's."""
+    tmp = rtfm_dir / "touched_files.tmp"
+    try:
+        if tmp.exists() and tmp.stat().st_size > 0:
+            return True
+    except OSError:
+        pass
+    return any(rtfm_dir.glob(CLAIMED_GLOB))
+
+
+def _claim(rtfm_dir: Path) -> tuple[set[str], list[Path]]:
+    """Take the queue and whatever a cut drain left. Call under the lock."""
+    claimed = list(rtfm_dir.glob(CLAIMED_GLOB))
+    tmp = rtfm_dir / "touched_files.tmp"
+    if tmp.exists():
+        mine = rtfm_dir / f"touched_files.{os.getpid()}.draining"
+        try:
+            os.replace(tmp, mine)
+            claimed.append(mine)
+        except OSError:
+            pass
+    touched: set[str] = set()
+    for path in claimed:
+        try:
+            touched |= {ln.strip() for ln in
+                        path.read_text(encoding="utf-8").splitlines() if ln.strip()}
+        except OSError:
+            continue
+    return touched, claimed
+
+
+def _release(claimed: list[Path]) -> None:
+    for path in claimed:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def main() -> None:
+    """Drain the edit queue, once at a time.
+
+    The hook runs in the background since 0.53.0 — it used to hold every
+    prompt and every end of turn, up to its time limit when several sessions
+    fed the same queue. Two drains can now overlap: the second finds the
+    lock held and leaves at once; what it would have taken stays queued for
+    the next. A drain cut short (the session closed) leaves its claimed
+    lines behind, and the next drain takes them.
+    """
+    project_root = _project_root()
+    if not project_root:
+        return
+
+    rtfm_dir = project_root / ".rtfm"
+    if not rtfm_dir.exists():
+        return
+
+    # A git worktree is served read-only from its main tree: nothing to
+    # index or enrol from here.
+    from rtfm.core.placement import worktree_main_root
+    if worktree_main_root(project_root) is not None:
+        return
+
+    db_path = rtfm_dir / "library.db"
+    if not db_path.exists():
+        return
+
+    if not pending(rtfm_dir):
+        return
+
+    from rtfm.core.portable import open_lock_file, try_lock_exclusive, unlock
+    try:
+        fd = open_lock_file(rtfm_dir / "drain.lock")
+    except OSError:
+        return
+    try:
+        if not try_lock_exclusive(fd):
+            return              # another drain is running; it or the next takes the rest
+        try:
+            _drain(project_root, rtfm_dir, db_path)
+        finally:
+            unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _drain(project_root: Path, rtfm_dir: Path, db_path: Path) -> None:
+    touched, claimed = _claim(rtfm_dir)
+    if not touched:
+        _release(claimed)
+        return
+
+    sources, default_corpus = _load_sources(rtfm_dir, project_root)
+
+    # Group touched files by their owning source — pick the longest path
+    # that contains the file, so a nested source wins over its parent.
+    sources_sorted = sorted(
+        (
+            (Path(s.get("path", ".")).resolve(),
+             s.get("corpus", default_corpus),
+             s.get("extensions"))
+            for s in sources
+        ),
+        key=lambda t: -len(str(t[0])),
+    )
+    by_source: dict[tuple, list[str]] = defaultdict(list)
+    unmatched: list[str] = []
+    for fp in touched:
+        try:
+            p = Path(fp).resolve()
+        except Exception:
+            unmatched.append(fp)
+            continue
+        matched = False
+        for root, corpus, exts in sources_sorted:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            by_source[(root, corpus, exts)].append(str(rel))
+            matched = True
+            break
+        if not matched:
+            unmatched.append(fp)
+
+    if not by_source:
+        _log(project_root, f"stop-sync skipped: {len(touched)} file(s) outside any source")
+        _release(claimed)
+        return
+
+    _log(
+        project_root,
+        f"stop-sync targeted: {len(touched)} file(s) across {len(by_source)} source(s)"
+        + (f", {len(unmatched)} outside any source" if unmatched else ""),
+    )
+    t0 = time.time()
+    try:
+        from rtfm.core.library import Library
+        from rtfm.core.sync import sync
+
+        lib = Library(str(db_path))
+        total_added = total_modified = 0
+        for (root, corpus, exts), files in by_source.items():
+            ext_set = None
+            if exts:
+                ext_set = {e.strip() if e.strip().startswith(".") else f".{e.strip()}"
+                           for e in exts.split(",")}
+            result = sync(
+                library=lib, root=root, corpus=corpus,
+                files=files, extensions=ext_set,
+                generate_embeddings=False,
+            )
+            total_added += result.added
+            total_modified += result.modified
+        lib.close()
+        elapsed = time.time() - t0
+        _log(project_root,
+             f"stop-sync done +{total_added} ~{total_modified} time={elapsed:.2f}s")
+        # Released only after a successful sync — cut or crashed, the
+        # claimed lines stay behind and the next drain retries them.
+        _release(claimed)
+        # A project fed only by this hook, and never enrolled, is never
+        # scanned: it holds what agents edited and nothing else. Enrol it
+        # (registration only — never start a worker from plugin code).
+        try:
+            from rtfm.core import registry
+            if not registry.is_enrolled(rtfm_dir):
+                if registry.register(rtfm_dir):
+                    _log(project_root, "enrolled — the worker now scans this project")
+                else:
+                    _log(project_root, "could not enrol — run `rtfm worker start` here")
+        except Exception as e:
+            _log(project_root, f"enrol ERROR: {e}")
+    except Exception as e:
+        _log(project_root, f"stop-sync ERROR: {e}")
+
+
+if __name__ == "__main__":
+    main()

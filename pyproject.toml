@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rtfm-ai"
+version = "0.55.1"
+description = "RTFM — The open retrieval layer for AI agents. Indexes code, docs, legal, research, data. Extensible parser system. Serves surgical context via MCP."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "roomi-fields" }
+]
+keywords = [
+    "mcp", "claude-code", "retrieval", "context",
+    "search", "indexing", "fts5", "sqlite", "embeddings",
+    "ai-agent", "knowledge-base", "developer-tools",
+    "open-source", "extensible", "multi-domain",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Indexing",
+]
+
+dependencies = [
+    "pyyaml>=6.0",
+    "pathspec>=0.12",
+]
+
+[project.optional-dependencies]
+pdf = [
+    "pdftext>=0.3.0",
+    "marker-pdf>=0.2.0",
+]
+ocr = [
+    # CPU-friendly OCR backend (default). Needs the tesseract binary
+    # on the system (apt install tesseract-ocr tesseract-ocr-<lang>).
+    "pytesseract>=0.3.10",
+    "pypdfium2>=4.0",
+    "Pillow>=9.0",
+]
+embeddings = [
+    "fastembed>=0.3.0",
+]
+xlsx = [
+    "openpyxl>=3.0",
+]
+epub = [
+    "ebooklib>=0.18",
+    "beautifulsoup4>=4.12",
+]
+mobi = [
+    "mobi>=0.3.3",
+    "beautifulsoup4>=4.12",
+]
+audio = [
+    # Tags and stream facts of audio files (MIDI needs nothing).
+    "mutagen>=1.47",
+]
+office = [
+    "python-docx>=1.0",
+    "odfpy>=1.4",
+    "striprtf>=0.0.26",
+]
+# kept for backward-compatibility — users still doing `pip install rtfm-ai[mcp]` won't break
+mcp = []
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "jsonschema>=4.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+rtfm = "rtfm.cli:main"
+rtfm-serve = "rtfm.mcp:main"
+
+[project.urls]
+Homepage = "https://rtfm.roomi-fields.com/"
+Documentation = "https://rtfm.roomi-fields.com/"
+Repository = "https://github.com/roomi-fields/rtfm"
+Issues = "https://github.com/roomi-fields/rtfm/issues"
+Changelog = "https://rtfm.roomi-fields.com/CHANGELOG/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rtfm"]
+
+[tool.mcp]
+name = "io.github.roomi-fields/rtfm"
+
+[tool.pytest.ini_options]
+testpaths = ["rtfm/tests"]
+python_files = "test_*.py"
+markers = [
+    "network: tests that require outbound network access (skip with `pytest -m 'not network'`)",
+]
+
+[tool.ruff]
+target-version = "py310"
+# NOTE: ~755 pre-existing violations as of 0.28.0 (unused imports, bare
+# excepts, naive datetimes, ambiguous names) — the count drifted well past the
+# ~83 recorded here earlier. The CI `lint` job stays non-blocking until that
+# backlog is cleared; once `ruff check rtfm/` is clean, drop
+# `continue-on-error` in ci.yml.
