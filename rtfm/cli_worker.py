@@ -1,0 +1,465 @@
+"""CLI commands for the mutualised worker (the *supervisor*).
+
+Since 0.25 there is exactly **one** worker process for the whole machine —
+the supervisor (see :mod:`rtfm.core.supervisor`) — instead of one detached
+daemon per project. It reads ``~/.rtfm/workers.json`` and services every
+registered project's queue, with a bounded thread pool and a single writer
+per ``library.db``.
+
+User-facing subcommands:
+  - ``rtfm worker``        → start / stop / restart-all / status (the supervisor)
+  - ``rtfm queue``         → inspect/manage one project's work queue
+  - ``rtfm worker-daemon`` (hidden) → the supervisor loop itself, spawned by
+                             :func:`ensure_supervisor_running`.
+
+``ensure_worker_running(rtfm_dir)`` is kept as the public "make sure my
+project gets serviced" entry point every producer (CLI, hooks, MCP) calls:
+it registers the project and makes sure the one supervisor is alive.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from rtfm.config import find_rtfm_root
+from rtfm.core import registry
+from rtfm.core.queue import Queue
+from rtfm.core.supervisor import (
+    clear_stop_request, clear_supervisor_state, request_stop,
+    run_supervisor, supervisor_running,
+)
+from rtfm.core.portable import (
+    background_python,
+    detached_popen_kwargs,
+    hard_kill_signal,
+    pid_alive,
+)
+
+
+# ── Lazy version-drift restart (called from cli.main) ────────────────────
+
+_LAZY_CHECK_INTERVAL_S = 60.0
+_LAZY_CHECK_MARKER = Path.home() / ".rtfm" / "last-version-check"
+
+
+def _maybe_lazy_restart_stale_workers() -> None:
+    """Throttled check: if the supervisor is dead or running on a different
+    ``rtfm-ai`` version than the CLI just loaded, restart it once.
+
+    Called from ``cli.main`` at the start of every command. Best-effort:
+    any error is swallowed. The marker is touched on every call so a burst
+    of commands doesn't fire a burst of restarts.
+    """
+    import importlib.metadata as _m
+
+    try:
+        last = _LAZY_CHECK_MARKER.stat().st_mtime
+        if time.time() - last < _LAZY_CHECK_INTERVAL_S:
+            return
+    except OSError:
+        pass
+    try:
+        _LAZY_CHECK_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _LAZY_CHECK_MARKER.touch()
+    except OSError:
+        pass
+
+    # Nothing registered yet → nothing to supervise.
+    if not registry.load():
+        return
+
+    try:
+        current_version = _m.version("rtfm-ai")
+    except _m.PackageNotFoundError:
+        return  # source checkout: nothing to compare against
+
+    state = supervisor_running()
+    if state is not None:
+        worker_v = getattr(state, "installed_version", None) or "unknown"
+        if worker_v == "unknown" or worker_v == current_version:
+            return  # healthy and current — nothing to do
+        # else: version drift → restart below.
+
+    # Supervisor is either down or stale — (re)start it once, detached.
+    try:
+        subprocess.Popen(
+            [background_python(), "-m", "rtfm.cli", "worker", "restart-all"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **detached_popen_kwargs(),
+        )
+    except Exception:
+        pass
+
+
+# ── Spawn helpers ────────────────────────────────────────────────────────
+
+def _which(binname: str) -> str | None:
+    from shutil import which
+    return which(binname)
+
+
+def _spawn_env() -> dict:
+    """Env for the supervisor Popen: inherit the parent env and layer in the
+    thread caps so onnxruntime initialises with a bounded intra-op pool."""
+    from rtfm.core.throttle import thread_cap_env
+    return {**os.environ, **thread_cap_env()}
+
+
+def ensure_supervisor_running() -> int | None:
+    """Spawn the one supervisor if it isn't already running. Returns its
+    PID, or ``None`` if another starter won the race. Idempotent.
+
+    Runs niced + ioniced (best-effort) so background indexing never
+    competes with the user's interactive work.
+    """
+    state = supervisor_running()
+    if state is not None:
+        return state.pid
+    # Stale state from a crashed supervisor — drop it before respawning.
+    clear_supervisor_state()
+
+    cmd = [background_python(), "-m", "rtfm.cli", "worker-daemon"]
+    wrappers: list[str] = []
+    for binname, flags in (("ionice", ["-c", "3"]), ("nice", ["-n", "19"])):
+        if _which(binname):
+            wrappers += [binname, *flags]
+    proc = subprocess.Popen(
+        wrappers + cmd,
+        cwd=str(Path.home()),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        # immune to parent SIGHUP / hook timeout / closing console
+        **detached_popen_kwargs(),
+        env=_spawn_env(),
+    )
+    return proc.pid
+
+
+def ensure_worker_running(rtfm_dir: Path) -> int | None:
+    """Register *rtfm_dir* and make sure the supervisor is alive.
+
+    Kept as the stable entry point every producer (``rtfm sync``, the hooks,
+    the MCP server) calls. In the mutualised model "start my project's
+    worker" means "add my project to the registry and ensure the one
+    supervisor is running" — the supervisor picks the new project up on its
+    next registry poll. Returns the supervisor PID.
+    """
+    registry.register(rtfm_dir)
+    return ensure_supervisor_running()
+
+
+# ── ``rtfm worker-daemon`` (hidden) — the supervisor loop ────────────────
+
+def cmd_worker_daemon(args):
+    """Run the mutualised supervisor. Hidden from ``--help``; spawned by
+    :func:`ensure_supervisor_running`. Exits silently if another supervisor
+    already holds the global lock."""
+    run_supervisor()
+
+
+def _report_stalled_work() -> None:
+    """Say what is waiting when there is nobody to do it.
+
+    A dead supervisor used to be reported as one line — "supervisor not
+    running" — with no hint that thousands of jobs were sitting still because
+    of it. Whoever noticed the index had stopped moving had to work out on
+    their own that the two facts were the same fact.
+    """
+    import sqlite3
+
+    stalled: list[tuple[str, int]] = []
+    for entry in registry.load():
+        db = Path(entry) / "library.db"
+        if not db.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            n = conn.execute(
+                "SELECT COUNT(*) FROM work_queue "
+                "WHERE status IN ('pending', 'running')"
+            ).fetchone()[0]
+            conn.close()
+        except Exception:
+            continue
+        if n:
+            stalled.append((Path(entry).parent.name, n))
+
+    if not stalled:
+        return
+    total = sum(n for _, n in stalled)
+    stalled.sort(key=lambda x: -x[1])
+    head = ", ".join(f"{name} ({n})" for name, n in stalled[:5])
+    more = f", +{len(stalled) - 5} more" if len(stalled) > 5 else ""
+    print(f"  {total} job(s) waiting in {len(stalled)} project(s): {head}{more}")
+    print("  Nothing will move until it is running again: rtfm worker start")
+
+
+# ── ``rtfm worker [start|stop|status|restart-all]`` ──────────────────────
+
+def cmd_worker(args):
+    action = getattr(args, "action", "status") or "status"
+
+    if action == "restart-all":
+        return _cmd_worker_restart_all()
+
+    if action == "status":
+        state = supervisor_running()
+        if not state:
+            print("worker: supervisor not running.")
+            _report_stalled_work()
+            return
+        print(f"worker: supervisor running (PID {state.pid}, host {state.host})")
+        print(f"  concurrency: {state.concurrency}")
+        print(f"  projects:    {state.projects} ({state.in_flight} job(s) in flight)")
+        print(f"  jobs:        {state.jobs_done} done, {state.jobs_failed} failed")
+        print(f"  started:     {state.started_at}")
+        busy = [name for name, p in (state.per_project or {}).items() if p.get("active")]
+        if busy:
+            print(f"  busy now:    {', '.join(sorted(busy))}")
+        return
+
+    if action == "start":
+        # Register the current project if we're inside one, so a bare
+        # ``rtfm worker start`` from a project root also enrolls it.
+        rtfm_root = find_rtfm_root()
+        if rtfm_root is not None:
+            registry.register(rtfm_root / ".rtfm")
+        pid = ensure_supervisor_running()
+        if pid is None:
+            print("worker: could not start (another starter won the race).")
+            return
+        for _ in range(20):
+            time.sleep(0.1)
+            if supervisor_running():
+                break
+        state = supervisor_running()
+        if state:
+            print(f"worker: supervisor started (PID {state.pid}).")
+        else:
+            print(f"worker: supervisor spawned (PID {pid}) — waiting on state file...")
+        return
+
+    if action == "stop":
+        state = supervisor_running()
+        if not state:
+            print("worker: supervisor not running.")
+            return
+        request_stop(state.pid)
+        for _ in range(60):  # up to 6s — let in-flight jobs finish cleanly
+            time.sleep(0.1)
+            if not pid_alive(state.pid):
+                break
+        if pid_alive(state.pid):
+            print(f"worker: stop requested of PID {state.pid} — finishing "
+                  f"in-flight jobs.")
+        else:
+            print(f"worker: supervisor stopped (PID {state.pid}).")
+            clear_stop_request()
+            clear_supervisor_state()
+        return
+
+    sys.exit(
+        f"worker: unknown action {action!r}. "
+        "Use start | stop | status | restart-all."
+    )
+
+
+def _cmd_worker_restart_all() -> None:
+    """Restart the one supervisor. Named ``restart-all`` for continuity with
+    the pre-0.25 fleet command and the hook/lazy-check callers.
+
+    Ask it to stop (in-flight jobs finish, so no DB write is interrupted →
+    no corruption), wait, hard-kill only as a last resort, then respawn.
+
+    The request is a file the supervisor reads, not a signal, because a
+    signal cannot mean "when you are ready" on Windows — see
+    :func:`rtfm.core.supervisor.request_stop`. The last resort still is one:
+    a supervisor wedged in a syscall never reads anything.
+    """
+    state = supervisor_running()
+    old_pid = None
+    if state is not None:
+        old_pid = state.pid
+        request_stop(old_pid)
+        for _ in range(80):  # up to 8s of graceful drain
+            time.sleep(0.1)
+            if not pid_alive(old_pid):
+                break
+        if pid_alive(old_pid):
+            try:
+                os.kill(old_pid, hard_kill_signal())
+            except ProcessLookupError:
+                pass
+            time.sleep(0.5)
+    clear_stop_request()
+    clear_supervisor_state()
+
+    new_pid = ensure_supervisor_running()
+    if new_pid is None:
+        print("worker restart-all: spawn failed")
+        sys.exit(1)
+    for _ in range(20):
+        time.sleep(0.1)
+        if supervisor_running():
+            break
+    if old_pid is not None:
+        print(f"worker restart-all: supervisor restarted ({old_pid} → {new_pid})")
+    else:
+        print(f"worker restart-all: supervisor started (PID {new_pid})")
+
+
+# ── ``rtfm queue [stats|list|failed|clear-done|retry-failed|reap]`` ──────
+
+def cmd_queue(args):
+    # Accept an explicit --db (like `rtfm files` / `rtfm status`) so a queue
+    # can be inspected from anywhere, not only from inside its project tree.
+    explicit_db = getattr(args, "db", None)
+    if explicit_db:
+        from rtfm.config import resolve_db
+        db_path = Path(resolve_db(explicit_db))
+        rtfm_dir = db_path.parent
+    else:
+        rtfm_root = find_rtfm_root()
+        if rtfm_root is None:
+            sys.exit("queue: no .rtfm/ project root in the cwd chain "
+                     "(or pass --db PATH).")
+        rtfm_dir = rtfm_root / ".rtfm"
+        db_path = rtfm_dir / "library.db"
+    queue = Queue(db_path)
+
+    def _total(kind: str) -> int:
+        """Total rows in `kind` status across all job types, so a truncated
+        listing can honestly say 'showing N of M' instead of silently
+        stopping at the limit."""
+        return sum(b.get(kind, 0) for b in queue.stats().values())
+
+    def _resolve_limit() -> int:
+        n = getattr(args, "limit", 20)
+        n = 20 if n is None else n
+        return 10_000_000 if n <= 0 else n  # 0/negative → effectively all
+
+    action = getattr(args, "action", "stats") or "stats"
+    try:
+        if action == "stats":
+            stats = queue.stats()
+            if not stats:
+                print("queue: empty.")
+                return
+            for jtype in sorted(stats):
+                breakdown = stats[jtype]
+                parts = [f"{status}={count}" for status, count in sorted(breakdown.items())]
+                print(f"  {jtype:<8} {' '.join(parts)}")
+            return
+
+        if action == "list":
+            limit = _resolve_limit()
+            total = _total("pending")
+            jobs = queue.list_pending(limit=limit)
+            if not jobs:
+                print("queue: no pending jobs.")
+                return
+            for j in jobs:
+                fp = j.payload.get("filepath") or j.payload.get("file_path") or ""
+                print(f"  #{j.id:<6} P{j.priority} {j.type:<8} {fp}")
+            if len(jobs) < total:
+                print(f"  … showing {len(jobs)} of {total} pending "
+                      f"(--limit 0 for all).")
+            return
+
+        if action == "failed":
+            limit = _resolve_limit()
+            total = _total("failed")
+            jobs = queue.list_failed(limit=limit)
+            if not jobs:
+                print("queue: no failed jobs.")
+                return
+            for j in jobs:
+                fp = j.payload.get("filepath") or ""
+                err = (j.error or "").splitlines()[0][:80]
+                print(f"  #{j.id:<6} {j.type:<8} {fp}")
+                print(f"          ! {err}")
+            if len(jobs) < total:
+                print(f"  … showing {len(jobs)} of {total} failed "
+                      f"(--limit 0 for all).")
+            return
+
+        if action == "clear-done":
+            keep = getattr(args, "keep", 100) or 100
+            n = queue.clear_done(keep_last=keep)
+            print(f"queue: removed {n} done row(s), kept last {keep}.")
+            return
+
+        if action == "retry-failed":
+            n = queue.retry_failed()
+            print(f"queue: moved {n} failed row(s) back to pending.")
+            # A failure is remembered twice: as a queue row, and as "this
+            # content does not parse" so scans stop re-proposing it. Clearing
+            # only the first leaves the file out of the index anyway.
+            from rtfm.core.library import Library
+            lib = Library(str(db_path), create=False)
+            try:
+                forgotten = lib.forget_ingest_failures()
+            finally:
+                lib.close()
+            if forgotten:
+                print(f"queue: forgot {forgotten} remembered parse failure(s) "
+                      f"— the next scan will offer those files again.")
+            return
+
+        if action == "reap":
+            conn = queue._get_conn()
+            zombies = list(conn.execute(
+                "SELECT id, type, priority, payload, attempts, started_at "
+                "FROM work_queue WHERE status = 'running' "
+                "ORDER BY started_at"
+            ).fetchall())
+            if not zombies:
+                print("queue: nothing to reap (no jobs in 'running' state).")
+                return
+            # A running supervisor owns those rows and sweeps its own stale
+            # claims every minute. From out here we cannot tell its live jobs
+            # from stale ones, and reaping blind would yank work out from
+            # under it — the row goes back to pending, gets dispatched a
+            # second time, and the same file is indexed twice concurrently.
+            from rtfm.core.supervisor import supervisor_running
+            live = supervisor_running()
+            if live is not None:
+                print(f"queue: {len(zombies)} job(s) running, but the "
+                      f"supervisor (PID {live.pid}) is alive and reaps its "
+                      f"own stale claims. Nothing to do from here — stop it "
+                      f"first if you really mean to reset every claim.")
+                return
+            result = queue.reap_zombies()
+            deduped_msg = (
+                f", {result.get('deduped', 0)} duplicates dropped"
+                if result.get("deduped") else ""
+            )
+            print(
+                f"queue: reaped {result['requeued']} job(s) back to pending, "
+                f"{result['failed']} marked failed (retry limit reached)"
+                f"{deduped_msg}."
+            )
+            print()
+            print(f"Details ({len(zombies)} candidate(s) before reap):")
+            for z in zombies:
+                try:
+                    payload = json.loads(z["payload"])
+                except Exception:
+                    payload = {}
+                fp = payload.get("filepath") or payload.get("root") or ""
+                print(
+                    f"  #{z['id']:<6} P{z['priority']} {z['type']:<10} "
+                    f"attempts={z['attempts']} started={z['started_at']} {fp}"
+                )
+            return
+
+        sys.exit(f"queue: unknown action {action!r}.")
+    finally:
+        queue.close()

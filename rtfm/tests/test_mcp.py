@@ -1,0 +1,1208 @@
+"""Tests for rtfm.mcp server tools.
+
+These tests call the tool functions directly (not via MCP transport)
+to verify the business logic.
+"""
+
+import os
+import time
+
+import pytest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from rtfm import Library
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mcp_db(tmp_path):
+    """Create a temporary DB with synced content and point RTFM_DB at it."""
+    db_path = tmp_path / "test.db"
+    lib = Library(db_path)
+
+    # Create a markdown file with searchable content
+    md = tmp_path / "doc.md"
+    md.write_text(
+        "# Philosophy\n\n"
+        "The nature of consciousness is a profound topic that has been explored by many thinkers. "
+        "Self-inquiry is a method taught by Ramana Maharshi. "
+        "It involves asking 'Who am I?' to discover the true nature of the self.\n\n"
+        "## Meditation\n\n"
+        "Meditation is a practice that helps calm the mind and develop awareness. "
+        "Through regular practice, one can experience deeper states of consciousness "
+        "and gain insight into the nature of reality.\n"
+    )
+    # Use sync to set sync_root (enables path resolution in expand)
+    lib.sync(root=tmp_path, corpus="test", extensions={".md"}, generate_embeddings=False)
+    lib.close()
+
+    with patch.dict(os.environ, {"RTFM_DB": str(db_path)}):
+        import rtfm.mcp as mcp_mod
+        mcp_mod._library = None
+        yield db_path
+        mcp_mod._library = None
+
+
+@pytest.fixture
+def multi_source_db(tmp_path):
+    """Create a DB with multiple source documents sharing common terms."""
+    db_path = tmp_path / "multi.db"
+    lib = Library(db_path)
+
+    # Source 1: Python guide (3 chunks about programming)
+    py_guide = tmp_path / "python_guide.md"
+    py_guide.write_text(
+        "# Python Programming Guide\n\n"
+        "Python is a versatile programming language used for web development, "
+        "data science, and automation. Functions are first-class objects.\n\n"
+        "## Functions\n\n"
+        "Functions in Python are defined with the def keyword. "
+        "They can accept arguments and return values. "
+        "Lambda functions provide a concise way to create anonymous functions.\n\n"
+        "## Classes\n\n"
+        "Object-oriented programming in Python uses classes. "
+        "Classes encapsulate data and behavior. Inheritance allows code reuse.\n"
+    )
+
+    # Source 2: JavaScript guide (3 chunks about programming)
+    js_guide = tmp_path / "javascript_guide.md"
+    js_guide.write_text(
+        "# JavaScript Programming Guide\n\n"
+        "JavaScript is the language of the web. It runs in browsers and on servers "
+        "with Node.js. Functions are first-class citizens in JavaScript.\n\n"
+        "## Functions\n\n"
+        "JavaScript functions can be declared or expressed. "
+        "Arrow functions provide compact syntax. Closures capture variables.\n\n"
+        "## Async Programming\n\n"
+        "Promises and async/await make asynchronous programming manageable. "
+        "The event loop processes callbacks and microtasks.\n"
+    )
+
+    # Source 3: Rust guide (3 chunks about programming)
+    rust_guide = tmp_path / "rust_guide.md"
+    rust_guide.write_text(
+        "# Rust Programming Guide\n\n"
+        "Rust is a systems programming language focused on safety and performance. "
+        "The borrow checker enforces memory safety at compile time.\n\n"
+        "## Functions\n\n"
+        "Rust functions use the fn keyword. Return types are specified after an arrow. "
+        "Closures can capture environment variables by reference or by value.\n\n"
+        "## Ownership\n\n"
+        "Ownership is Rust's core concept. Each value has exactly one owner. "
+        "When the owner goes out of scope, the value is dropped.\n"
+    )
+
+    # Use sync to set sync_root
+    lib.sync(root=tmp_path, corpus="test", extensions={".md"}, generate_embeddings=False)
+    lib.close()
+
+    with patch.dict(os.environ, {"RTFM_DB": str(db_path)}):
+        import rtfm.mcp as mcp_mod
+        mcp_mod._library = None
+        yield db_path
+        mcp_mod._library = None
+
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+
+class TestMCPSearch:
+    def test_search_returns_results(self, mcp_db):
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("consciousness self-inquiry")
+        assert "sources for" in result
+        assert "L" in result  # line markers (L42-58 format)
+
+    def test_search_no_results(self, mcp_db):
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("xyznonexistent123456")
+        assert "No results" in result
+
+    def test_search_fts_mode(self, mcp_db):
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("meditation", search_type="fts")
+        assert "meditation" in result.lower() or "No results" in result
+
+    def test_search_accepts_limit_as_string(self, mcp_db):
+        """Regression: some MCP clients pass numeric params as strings
+        ('limit': '5'). Must not crash with TypeError in library.search()."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("consciousness", limit="5")
+        assert "sources for" in result or "No results" in result
+
+    def test_search_accepts_weights_as_strings(self, mcp_db):
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search(
+            "consciousness",
+            limit="3",
+            freshness_weight="0.1",
+            centrality_weight="0.0",
+        )
+        assert "sources for" in result or "No results" in result
+
+    def test_search_handles_garbage_limit(self, mcp_db):
+        """Unparseable limit falls back to default rather than crashing."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("consciousness", limit="not-a-number")
+        assert "sources for" in result or "No results" in result
+
+
+class TestMCPCoercionHelpers:
+    def test_coerce_int_passthrough(self):
+        from rtfm.mcp import _coerce_int
+        assert _coerce_int(5, 0) == 5
+        assert _coerce_int(0, 99) == 0
+
+    def test_coerce_int_string(self):
+        from rtfm.mcp import _coerce_int
+        assert _coerce_int("5", 0) == 5
+        assert _coerce_int(" 12 ", 0) == 12
+
+    def test_coerce_int_none_returns_default(self):
+        from rtfm.mcp import _coerce_int
+        assert _coerce_int(None, 42) == 42
+
+    def test_coerce_int_garbage_returns_default(self):
+        from rtfm.mcp import _coerce_int
+        assert _coerce_int("abc", 7) == 7
+        assert _coerce_int([1, 2], 7) == 7
+        assert _coerce_int({}, 7) == 7
+
+    def test_coerce_int_rejects_bool(self):
+        """bool is a subclass of int — coercing True to 1 would silently
+        accept boolean flags as counts. Reject and use default."""
+        from rtfm.mcp import _coerce_int
+        assert _coerce_int(True, 5) == 5
+        assert _coerce_int(False, 5) == 5
+
+    def test_coerce_float_basics(self):
+        from rtfm.mcp import _coerce_float
+        assert _coerce_float(0.5, 0.0) == 0.5
+        assert _coerce_float("0.3", 0.0) == 0.3
+        assert _coerce_float(None, 0.7) == 0.7
+        assert _coerce_float("xyz", 0.9) == 0.9
+        assert _coerce_float(True, 0.4) == 0.4
+
+
+class TestMCPStats:
+    def test_stats(self, mcp_db):
+        from rtfm.mcp import rtfm_stats
+        result = rtfm_stats()
+        assert "Chunks:" in result
+        assert "Books:" in result
+
+
+class TestMCPTags:
+    def test_tags_empty(self, mcp_db):
+        from rtfm.mcp import rtfm_tags
+        result = rtfm_tags()
+        assert "No tags" in result or "tag" in result.lower()
+
+
+class TestMCPBooks:
+    def test_books(self, mcp_db):
+        from rtfm.mcp import rtfm_books
+        result = rtfm_books()
+        assert "chunk" in result.lower()
+
+    def test_books_with_corpus(self, mcp_db):
+        from rtfm.mcp import rtfm_books
+        result = rtfm_books(corpus="nonexistent")
+        assert "No books" in result
+
+
+class TestMCPIngest:
+    def test_ingest(self, mcp_db, tmp_path):
+        from rtfm.mcp import rtfm_ingest
+        f = tmp_path / "new.txt"
+        f.write_text("New content for ingestion test.\n" * 10)
+        result = rtfm_ingest(str(f))
+        assert "Ingested" in result
+        assert "chunks" in result.lower()
+
+    def test_ingest_missing_file(self, mcp_db):
+        from rtfm.mcp import rtfm_ingest
+        result = rtfm_ingest("/nonexistent/file.txt")
+        assert "not found" in result.lower() or "Error" in result
+
+
+class TestMCPTagChunks:
+    def test_tag_chunks(self, mcp_db):
+        from rtfm.mcp import rtfm_tag_chunks
+
+        # Get a chunk ID from the DB
+        lib = Library(mcp_db)
+        books = lib.list_books()
+        assert books, "Should have at least one book"
+
+        conn = lib._get_conn()
+        cursor = conn.execute("SELECT chunk_id FROM chunks LIMIT 1")
+        row = cursor.fetchone()
+        assert row, "Should have at least one chunk"
+        chunk_id = row["chunk_id"]
+        lib.close()
+
+        # Reset singleton since we opened a new connection
+        import rtfm.mcp as mcp_mod
+        mcp_mod._library = None
+
+        result = rtfm_tag_chunks(chunk_id, "philosophy,meditation")
+        assert "Added tags" in result
+
+
+class TestMCPRemove:
+    def test_remove_not_found(self, mcp_db):
+        from rtfm.mcp import rtfm_remove
+        result = rtfm_remove("nonexistent.txt")
+        assert "Not found" in result
+
+
+class TestMCPSync:
+    def test_sync(self, mcp_db, tmp_path):
+        from rtfm.mcp import rtfm_sync
+
+        # Create a file to sync
+        (tmp_path / "synctest.txt").write_text("Hello from sync test.\n" * 10)
+
+        result = rtfm_sync(str(tmp_path), corpus="sync-test")
+        assert "Sync complete" in result
+
+
+class TestMCPDiscover:
+    def test_discover_basic(self, tmp_path):
+        """rtfm_discover scans a directory and returns a readable map."""
+        (tmp_path / "main.py").write_text("print('hello')")
+        (tmp_path / "README.md").write_text("# Project")
+
+        from rtfm.mcp import rtfm_discover
+        result = rtfm_discover(str(tmp_path))
+
+        assert "Project:" in result
+        assert "Files:" in result
+        assert "Python" in result
+
+    def test_discover_empty_dir(self, tmp_path):
+        """Empty directory returns zeros."""
+        from rtfm.mcp import rtfm_discover
+        result = rtfm_discover(str(tmp_path))
+
+        assert "Files: 0" in result
+
+    def test_discover_nonexistent(self):
+        """Nonexistent path returns empty scan (0 files)."""
+        from rtfm.mcp import rtfm_discover
+        result = rtfm_discover("/nonexistent/path/12345")
+
+        assert "Files: 0" in result
+
+
+class TestMCPContext:
+    def test_context_returns_results(self, mcp_db):
+        """rtfm_context returns relevant context for a topic."""
+        from rtfm.mcp import rtfm_context
+        result = rtfm_context("consciousness meditation")
+
+        assert "sources for" in result
+        assert "L" in result  # line markers (L42-58 format)
+
+    def test_context_no_results(self, mcp_db):
+        """rtfm_context with unknown topic returns fallback hint."""
+        from rtfm.mcp import rtfm_context
+        result = rtfm_context("xyznonexistent999")
+
+        assert "No context found" in result
+        assert "Grep/Glob" in result
+
+    def test_context_limit(self, mcp_db):
+        """rtfm_context respects the limit parameter."""
+        from rtfm.mcp import rtfm_context
+        result = rtfm_context("consciousness", limit=1)
+
+        # Header reports source count
+        assert "1 sources for" in result or "0 sources for" in result or "No context" in result
+
+    def test_context_lazy_ingest(self, mcp_db, tmp_path):
+        """rtfm_context indexes an unindexed file on-the-fly."""
+        from rtfm.mcp import rtfm_context
+
+        # Create a file that's not yet indexed
+        newfile = tmp_path / "lazy_test.md"
+        newfile.write_text("# Lazy Test\n\nThis document talks about lazy indexing and on-the-fly ingestion.\n")
+
+        result = rtfm_context(str(newfile))
+
+        # Should have indexed it and found content (or at least not crashed)
+        assert "Error" not in result or "No context" in result
+
+
+class TestProgressiveDisclosure:
+    """Tests for search deduplication and rtfm_expand."""
+
+    def test_search_deduplicates_by_source(self, multi_source_db):
+        """Search returns 1 best chunk per unique source document."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming functions", limit=5)
+
+        assert "sources" in result
+        assert "L" in result  # line markers
+
+    def test_search_shows_also_line(self, multi_source_db):
+        """Sources with multiple relevant chunks show '+' continuation line."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming functions", limit=5)
+
+        # Each guide has 3 chunks; multiple should match "programming functions"
+        # so we expect "+" lines for at least some sources
+        assert "\n  + " in result or "L" in result
+
+    def test_search_returns_different_sources(self, multi_source_db):
+        """With 3 sources all about programming, we should get 3 unique sources."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming", limit=10)
+
+        # 3 unique source files appear in the output
+        assert "python_guide.md" in result
+        assert "javascript_guide.md" in result
+        assert "rust_guide.md" in result
+
+    def test_context_deduplicates(self, multi_source_db):
+        """rtfm_context also returns 1 chunk per source."""
+        from rtfm.mcp import rtfm_context
+        result = rtfm_context("functions programming")
+
+        assert "sources" in result
+        assert "L" in result  # line markers
+
+    def test_expand_first_chunk(self, multi_source_db):
+        """rtfm_expand without target returns first chunk with line numbers."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath)
+
+        # Header: path > section [1/N]
+        assert "python_guide.md" in result
+        assert "[1/" in result
+        # Content with line numbers (tab-separated)
+        assert "\t" in result
+        # Navigation hint
+        assert "Next in file" in result
+
+    def test_expand_with_query(self, multi_source_db):
+        """rtfm_expand with query shows matching chunk with line numbers."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, query="programming")
+
+        assert "python_guide.md" in result
+        assert "\t" in result  # line-numbered content
+
+    def test_expand_with_target_section(self, multi_source_db):
+        """rtfm_expand with target jumps to a specific section."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, target="Functions")
+
+        assert "Functions" in result
+        assert "\t" in result
+        # Functions is not the first section
+        assert "[1/" not in result or "Functions" in result
+
+    def test_expand_with_target_line(self, multi_source_db):
+        """rtfm_expand with L<number> target jumps to correct chunk."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        # L1 should land on the first chunk
+        result = rtfm_expand(filepath, target="L1")
+
+        assert "python_guide.md" in result
+        assert "[1/" in result  # first chunk
+
+    def test_expand_nonexistent_source(self, multi_source_db):
+        """rtfm_expand with unknown path returns not found."""
+        from rtfm.mcp import rtfm_expand
+        result = rtfm_expand("/nonexistent/path/file.py")
+        assert "not found" in result.lower()
+
+    def test_expand_target_not_found(self, multi_source_db):
+        """rtfm_expand with nonexistent target lists available sections."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, target="NonexistentSection")
+
+        assert "Target not found" in result
+        assert "Available sections" in result
+
+    def test_search_limit_respected(self, multi_source_db):
+        """limit=2 returns at most 2 unique sources."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming", limit=2)
+
+        assert "2 sources for" in result
+
+
+class TestMetadataOnlyOutput:
+    """Tests for the new metadata-only search output."""
+
+    def test_search_no_content_in_output(self, multi_source_db):
+        """Search results should NOT contain actual chunk content."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming functions", limit=3)
+
+        # Should have metadata
+        assert "L" in result  # line markers
+
+        # Should NOT have full content from the documents
+        assert "first-class" not in result  # content from Python/JS guides
+
+    def test_search_shows_file_path(self, multi_source_db):
+        """Search results include file paths (absolute, no 'file:' prefix)."""
+        from rtfm.mcp import rtfm_search
+        result = rtfm_search("programming", limit=3)
+
+        # New format shows path directly, not "file: path"
+        assert "_guide.md" in result
+
+    def test_context_no_content_in_output(self, multi_source_db):
+        """Context results should NOT contain chunk content."""
+        from rtfm.mcp import rtfm_context
+        result = rtfm_context("programming functions")
+
+        assert "sources for" in result
+        assert "L" in result  # line markers
+        # Should not have full content
+        assert "first-class" not in result
+
+    def test_expand_has_content(self, multi_source_db):
+        """Expand SHOULD return full content (that's its purpose)."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, query="programming")
+
+        # Should have actual content with line numbers
+        assert len(result) > 200
+        assert "\t" in result
+
+    def test_expand_shows_path_in_header(self, multi_source_db):
+        """Expand header shows file path and section."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath)
+
+        # Header format: path > section [N/M]
+        assert "python_guide.md" in result
+        assert ">" in result
+
+    def test_expand_navigation_hints(self, multi_source_db):
+        """Expand shows navigation hints for next chunk."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath)
+
+        assert "⏹" in result
+        assert "Next in file" in result
+
+    def test_expand_query_pagination(self, multi_source_db):
+        """Expand with query supports offset pagination."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+
+        # First result
+        result0 = rtfm_expand(filepath, query="programming", offset=0)
+        assert "\t" in result0
+
+        # High offset should give "no more results"
+        result_high = rtfm_expand(filepath, query="programming", offset=100)
+        assert "No more results" in result_high or "No chunks" in result_high
+
+
+class TestResolveBookByPath:
+    """Tests for the shared path→book rule (rtfm.core.pathresolve)."""
+
+    def test_resolve_by_absolute_path(self, multi_source_db):
+        """Resolve book using absolute file path via sync_root."""
+        from rtfm.core.pathresolve import resolve_book_by_path
+        from rtfm.mcp import _get_library
+
+        lib = _get_library()
+        conn = lib._get_conn()
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        row = resolve_book_by_path(conn, filepath)
+
+        assert row is not None
+        assert row["filename"] == "python_guide.md"
+
+    def test_resolve_nonexistent(self, multi_source_db):
+        """Unknown path returns None."""
+        from rtfm.core.pathresolve import resolve_book_by_path
+        from rtfm.mcp import _get_library
+
+        lib = _get_library()
+        conn = lib._get_conn()
+
+        row = resolve_book_by_path(conn, "/nonexistent/file.py")
+        assert row is None
+
+    def test_resolve_relative_direct(self, multi_source_db):
+        """Resolve book by exact match on relative filename."""
+        from rtfm.core.pathresolve import resolve_book_by_path
+        from rtfm.mcp import _get_library
+
+        lib = _get_library()
+        conn = lib._get_conn()
+
+        # Relative filename stored by sync
+        row = resolve_book_by_path(conn, "python_guide.md")
+        assert row is not None
+        assert row["filename"] == "python_guide.md"
+
+
+class TestRenderChunk:
+    """Tests for _render_chunk helper."""
+
+    def test_reads_file_lines(self, tmp_path):
+        from rtfm.mcp import _render_chunk
+        f = tmp_path / "test.py"
+        f.write_text("line one\nline two\nline three\n")
+        result = _render_chunk(str(f), 1, 3)
+        lines = result.split("\n")
+        assert len(lines) == 3
+        assert "1" in lines[0] and "line one" in lines[0]
+        assert "2" in lines[1] and "line two" in lines[1]
+        assert "3" in lines[2] and "line three" in lines[2]
+        assert "\t" in lines[0]
+
+    def test_file_not_found(self):
+        from rtfm.mcp import _render_chunk
+        result = _render_chunk("/nonexistent/file.py", 1, 10)
+        assert "not found" in result.lower()
+
+    def test_no_path_returns_error(self):
+        from rtfm.mcp import _render_chunk
+        result = _render_chunk("", None, None)
+        assert "not available" in result.lower()
+
+
+class TestExpandCount:
+    """Tests for the count parameter in rtfm_expand."""
+
+    def test_count_default_one(self, multi_source_db):
+        """Default count=1 returns exactly one chunk."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath)
+
+        # Should show [1/N] (single chunk)
+        assert "[1/" in result
+        # No separator lines (only one chunk)
+        assert "───" not in result
+
+    def test_count_multiple(self, multi_source_db):
+        """count=2 returns two consecutive chunks with separators."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, count=2)
+
+        # Should show range [1-2/N]
+        assert "[1-2/" in result
+        # Should have separator between chunks
+        assert "───" in result
+
+    def test_count_all(self, multi_source_db):
+        """count=0 returns all chunks in file."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, count=0)
+
+        # End marker (last chunk, no "Next in file")
+        assert "⏹" in result
+        assert "Next in file" not in result
+
+    def test_count_with_target(self, multi_source_db):
+        """count with target starts from target chunk."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, target="Functions", count=2)
+
+        assert "Functions" in result
+        # Should show separator if there's a second chunk
+        assert "───" in result or "⏹" in result
+
+    def test_count_exceeds_remaining(self, multi_source_db):
+        """count larger than remaining chunks returns all remaining."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, count=100)
+
+        # Should get end marker (all chunks returned)
+        assert "⏹" in result
+        assert "Next in file" not in result
+
+    def test_count_query_mode(self, multi_source_db):
+        """count in query mode returns multiple relevant chunks."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+        result = rtfm_expand(filepath, query="programming", count=3)
+
+        # Should contain content with line numbers
+        assert "\t" in result
+
+
+class TestExpandLineNumbersMatchFile:
+    """Critical test: expand line numbers must match actual file lines.
+
+    When an agent sees '     5\tsome content' in expand output, line 5 of the
+    actual file MUST contain 'some content'.  Otherwise Edit/Read break.
+    """
+
+    def test_expand_lines_match_read(self, multi_source_db):
+        """Every numbered line in expand output must match the actual file."""
+        from rtfm.mcp import rtfm_expand
+
+        root = multi_source_db.parent
+        filepath = str(root / "python_guide.md")
+
+        # Read the actual file
+        with open(filepath) as f:
+            file_lines = f.readlines()
+
+        # Get expand output (all chunks)
+        result = rtfm_expand(filepath, count=0)
+
+        # Parse numbered lines from expand output
+        for output_line in result.split("\n"):
+            # Match lines like "     5\tcontent here"
+            parts = output_line.split("\t", 1)
+            if len(parts) == 2:
+                num_str = parts[0].strip()
+                content = parts[1]
+                if num_str.isdigit():
+                    line_num = int(num_str)
+                    # Line numbers are 1-indexed
+                    actual = file_lines[line_num - 1].rstrip("\n")
+                    assert content == actual, (
+                        f"Line {line_num} mismatch!\n"
+                        f"  expand: {content!r}\n"
+                        f"  file:   {actual!r}"
+                    )
+
+    def test_expand_lines_match_read_multiline_paragraphs(self, tmp_path):
+        """Test with content that markdown parser would reformat."""
+        from rtfm import Library
+
+        db_path = tmp_path / "test_lines.db"
+        lib = Library(db_path)
+
+        # Create a markdown file with multi-line paragraphs that the parser
+        # would normally collapse via ' '.join(p.split())
+        md = tmp_path / "multiline.md"
+        md.write_text(
+            "# Introduction\n\n"
+            "This is a paragraph that spans\n"
+            "multiple lines in the source file.\n"
+            "The markdown parser would normally\n"
+            "collapse these into a single line.\n\n"
+            "## Details\n\n"
+            "Here is another paragraph with\n"
+            "line breaks that should be\n"
+            "preserved in the expand output.\n"
+        )
+
+        lib.sync(root=tmp_path, corpus="test", extensions={".md"},
+                 generate_embeddings=False)
+        lib.close()
+
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"RTFM_DB": str(db_path)}):
+            import rtfm.mcp as mcp_mod
+            mcp_mod._library = None
+            try:
+                from rtfm.mcp import rtfm_expand
+
+                # Read the actual file
+                with open(md) as f:
+                    file_lines = f.readlines()
+
+                result = rtfm_expand(str(md), count=0)
+
+                # Every numbered line must match
+                for output_line in result.split("\n"):
+                    parts = output_line.split("\t", 1)
+                    if len(parts) == 2:
+                        num_str = parts[0].strip()
+                        content = parts[1]
+                        if num_str.isdigit():
+                            line_num = int(num_str)
+                            actual = file_lines[line_num - 1].rstrip("\n")
+                            assert content == actual, (
+                                f"Line {line_num} mismatch!\n"
+                                f"  expand: {content!r}\n"
+                                f"  file:   {actual!r}"
+                            )
+            finally:
+                mcp_mod._library = None
+
+
+class TestSearchExpandEditWorkflow:
+    """End-to-end test: search → expand → verify content can be used for Edit.
+
+    Simulates the full agent workflow:
+    1. rtfm_search to find relevant file
+    2. rtfm_expand to read content with line numbers
+    3. Extract a line from expand output
+    4. Verify that exact string exists in the real file (Edit would succeed)
+    """
+
+    def test_search_expand_edit_roundtrip(self, multi_source_db):
+        """Content from expand output can be found verbatim in the real file."""
+        import re
+        from rtfm.mcp import rtfm_search, rtfm_expand
+
+        root = multi_source_db.parent
+
+        # Step 1: Search
+        search_result = rtfm_search("programming functions")
+        assert "sources for" in search_result
+
+        # Extract file path from search result (first result line)
+        # Format: /path/to/file L<n>-<m> (section)
+        path_match = re.search(r'^(/\S+\.md)', search_result, re.MULTILINE)
+        assert path_match, f"Could not extract path from search result:\n{search_result}"
+        filepath = path_match.group(1)
+        assert os.path.isfile(filepath), f"Search returned non-existent path: {filepath}"
+
+        # Step 2: Expand
+        expand_result = rtfm_expand(filepath, count=0)
+        assert "\t" in expand_result
+
+        # Step 3: Extract lines from expand output
+        expand_lines = {}
+        for output_line in expand_result.split("\n"):
+            parts = output_line.split("\t", 1)
+            if len(parts) == 2:
+                num_str = parts[0].strip()
+                if num_str.isdigit():
+                    expand_lines[int(num_str)] = parts[1]
+
+        assert len(expand_lines) > 0, "No numbered lines in expand output"
+
+        # Step 4: Verify each line matches the real file (Edit would work)
+        with open(filepath) as f:
+            real_content = f.read()
+        real_lines = real_content.splitlines()
+
+        for line_num, expand_content in expand_lines.items():
+            real_line = real_lines[line_num - 1]
+            assert expand_content == real_line, (
+                f"Line {line_num}: expand content doesn't match file!\n"
+                f"  expand: {expand_content!r}\n"
+                f"  file:   {real_line!r}\n"
+                f"  An Edit using this content would FAIL."
+            )
+
+        # Step 5: Verify non-empty lines can be used as old_string for Edit
+        non_empty = [v for v in expand_lines.values() if v.strip()]
+        assert len(non_empty) > 0
+        for line_content in non_empty[:3]:  # Check first 3 non-empty
+            assert line_content in real_content, (
+                f"Content from expand not found in file (Edit old_string would fail):\n"
+                f"  {line_content!r}"
+            )
+
+
+# ── Freshness: the index must never quietly answer for a stale file ──────
+
+class TestFreshnessSignalling:
+    @pytest.fixture(autouse=True)
+    def no_indexer(self, monkeypatch):
+        """No supervisor is servicing these temp DBs, so read-repair cannot
+        complete — these tests cover what RTFM reports when it cannot fix
+        the drift itself. The repair path is covered below."""
+        from rtfm.core import freshness
+        monkeypatch.setattr(freshness, "indexer_is_running", lambda: False)
+
+    def _touch_far_enough_in_the_past(self, path, seconds=5):
+        """Age a file so its mtime is unambiguously older than indexing."""
+        import os as _os
+        import time as _time
+        when = _time.time() - seconds
+        _os.utime(path, (when, when))
+
+    def test_search_flags_a_file_modified_after_indexing(self, mcp_db, tmp_path):
+        from rtfm.mcp import rtfm_search
+
+        doc = tmp_path / "doc.md"
+        assert "⚠" not in rtfm_search("consciousness", limit=3)
+
+        doc.write_text(doc.read_text() + "\nA line added behind RTFM's back.\n")
+        out = rtfm_search("consciousness", limit=3)
+        assert "modified since indexing" in out
+
+    def test_search_queues_the_reindex_it_noticed(self, mcp_db, tmp_path):
+        from rtfm.core.queue import P_USER, Queue
+        from rtfm.mcp import rtfm_search
+
+        (tmp_path / "doc.md").write_text("# Philosophy\n\nconsciousness rewritten\n")
+        rtfm_search("consciousness", limit=3)
+
+        q = Queue(str(mcp_db))
+        job = q.dequeue()
+        q.close()
+        assert job is not None and job.type == "ingest"
+        assert job.priority == P_USER
+
+    def test_search_withholds_a_deleted_file(self, mcp_db, tmp_path):
+        """A file that is gone is not an answer.
+
+        It used to come back labelled, which leaves the reading to the
+        agent. On a repository that had just condensed 338 documents into
+        one, eleven of twelve results named files that no longer existed,
+        the surviving authority ranked below them, and the agent concluded
+        that nothing decided the question.
+        """
+        from rtfm.mcp import rtfm_search
+
+        (tmp_path / "doc.md").unlink()
+        out = rtfm_search("consciousness", limit=3)
+        assert "doc.md" not in out
+        assert "deleted since indexing" not in out
+
+    def test_search_asks_for_the_deleted_file_to_be_taken_out(
+            self, mcp_db, tmp_path):
+        from rtfm.core.queue import P_USER, Queue
+        from rtfm.mcp import rtfm_search
+
+        (tmp_path / "doc.md").unlink()
+        rtfm_search("consciousness", limit=3)
+
+        q = Queue(str(mcp_db))
+        jobs = []
+        while (job := q.dequeue()) is not None:
+            jobs.append(job)
+        q.close()
+        removals = [j for j in jobs if j.type == "remove"]
+        assert removals, "the index was left describing a file that is gone"
+        assert removals[0].priority == P_USER
+
+    def test_a_source_directory_that_vanished_is_not_a_deletion(
+            self, mcp_db, tmp_path, monkeypatch):
+        """An unmounted volume makes every file under it read as deleted.
+
+        Withholding on that evidence would empty a whole corpus out of the
+        answers for as long as the outage lasts, so the verdict is only
+        believed when the directory that held the file is readable.
+        """
+        from rtfm.core import freshness
+
+        assert not freshness.deleted_source_is_certain(
+            str(tmp_path / "parti" / "doc.md"), str(tmp_path / "parti"))
+        assert freshness.deleted_source_is_certain(
+            str(tmp_path / "doc.md"), str(tmp_path))
+
+    def test_expand_warns_that_line_ranges_may_have_shifted(self, mcp_db, tmp_path):
+        from rtfm.mcp import rtfm_expand
+
+        doc = tmp_path / "doc.md"
+        assert "⚠" not in rtfm_expand(str(doc))
+
+        doc.write_text("A brand new first line\n" + doc.read_text())
+        out = rtfm_expand(str(doc))
+        assert "modified since indexing" in out
+        assert "line ranges" in out
+
+    def test_untouched_file_is_never_flagged(self, mcp_db, tmp_path):
+        from rtfm.mcp import rtfm_expand, rtfm_search
+
+        self._touch_far_enough_in_the_past(tmp_path / "doc.md")
+        assert "⚠" not in rtfm_search("consciousness", limit=3)
+        assert "⚠" not in rtfm_expand(str(tmp_path / "doc.md"))
+
+
+class TestFreshnessReadRepair:
+    """When a supervisor is there to service it, a read fixes the drift it
+    finds and answers from the corrected index — a second of latency in
+    exchange for an answer that is actually right."""
+
+    @pytest.fixture
+    def mcp_db(self, tmp_path):
+        """A project laid out the way a real one is: ``.rtfm/library.db``
+        beside a config naming its sources. The catch-up scan refuses to run
+        without that, precisely so it can never guess at the wrong tree."""
+        from rtfm.config import add_source, save_config
+        from rtfm import Library
+
+        (tmp_path / ".rtfm").mkdir()
+        db_path = tmp_path / ".rtfm" / "library.db"
+        lib = Library(db_path)
+        (tmp_path / "doc.md").write_text(
+            "# Philosophy\n\n"
+            "The nature of consciousness is a profound topic. "
+            "Self-inquiry is a method taught by Ramana Maharshi.\n\n"
+            "## Meditation\n\n"
+            "Meditation calms the mind and develops awareness.\n"
+        )
+        lib.sync(root=tmp_path, corpus="test", extensions={".md"},
+                 generate_embeddings=False)
+        lib.close()
+
+        save_config(tmp_path, {"corpus": "test"})
+        add_source(tmp_path, str(tmp_path), "test", extensions=".md")
+
+        with patch.dict(os.environ, {"RTFM_DB": str(db_path)}):
+            import rtfm.mcp as mcp_mod
+            mcp_mod._library = None
+            yield db_path
+            mcp_mod._library = None
+
+    @pytest.fixture
+    def indexer(self, mcp_db, tmp_path):
+        """A stand-in supervisor: drains ingest jobs the way the real one
+        does, so the read under test has something to wait on."""
+        import threading
+
+        from rtfm.core.queue import Queue
+
+        stop = threading.Event()
+
+        def drain():
+            from rtfm.core.handlers import HANDLERS
+            from rtfm.core.worker import JobContext
+
+            q = Queue(str(mcp_db))
+            ctx = JobContext(str(mcp_db), lambda m: None)
+            try:
+                while not stop.is_set():
+                    job = q.dequeue()
+                    if job is None:
+                        stop.wait(0.02)
+                        continue
+                    if job.type == "embed":   # not what these tests measure
+                        q.mark_done(job.id)
+                        continue
+                    try:
+                        HANDLERS[job.type](job, ctx)
+                        q.mark_done(job.id)
+                    except Exception as exc:
+                        q.mark_failed(job.id, str(exc))
+            finally:
+                q.close()
+
+        from rtfm.core import freshness
+        real = freshness.indexer_is_running
+        freshness.indexer_is_running = lambda: True
+        t = threading.Thread(target=drain, daemon=True)
+        t.start()
+        yield
+        stop.set()
+        t.join(timeout=5)
+        freshness.indexer_is_running = real
+
+    def test_search_finds_what_an_agent_just_wrote(self, mcp_db, tmp_path, indexer):
+        """The point of the whole exercise: a word written moments ago is
+        findable, without the agent having to know about indexing at all.
+
+        This is the "no results" path — nothing came back to compare against
+        disk, so the only signal is the ingest the edit hook just queued."""
+        from rtfm.core.queue import P_USER, Queue
+        from rtfm.mcp import rtfm_search
+
+        doc = tmp_path / "doc.md"
+        assert "No results" in rtfm_search("epistemology", limit=3)
+
+        doc.write_text(doc.read_text() + "\n## Epistemology\n\nA new section.\n")
+        # What the edit hook does the instant an agent writes a file.
+        q = Queue(str(mcp_db))
+        q.enqueue("ingest", {"root": str(tmp_path), "corpus": "test",
+                             "filepath": "doc.md"}, priority=P_USER)
+        q.close()
+
+        out = rtfm_search("epistemology", limit=3)
+        assert "doc.md" in out
+        assert "⚠" not in out
+
+    def test_empty_answer_is_bounded(self, mcp_db, tmp_path, indexer):
+        """A miss must stay quick: the catch-up is capped by the budget, and
+        a word that is genuinely nowhere still comes back promptly."""
+        from rtfm.mcp import rtfm_search
+
+        t0 = time.time()
+        assert "No results" in rtfm_search("zzzznotaword", limit=3)
+        assert time.time() - t0 < 3.5
+
+    def test_empty_answer_scans_for_a_file_changed_behind_rtfm(
+            self, mcp_db, tmp_path, indexer):
+        """The last gap: a shell command, a build step or a git checkout
+        changes a file, so nothing queued it and nothing returned it. Only an
+        actual look at the disk can answer — cheap enough now to do on a miss."""
+        from rtfm.mcp import rtfm_search
+
+        assert "No results" in rtfm_search("phenomenology", limit=3)
+        (tmp_path / "doc.md").write_text(
+            "# Philosophy\n\nPhenomenology, added by something other than an agent.\n")
+
+        assert "doc.md" in rtfm_search("phenomenology", limit=3)
+
+    def test_repaired_search_reports_no_drift(self, mcp_db, tmp_path, indexer):
+        from rtfm.mcp import rtfm_search
+
+        doc = tmp_path / "doc.md"
+        doc.write_text("# Philosophy\n\nconsciousness, rewritten entirely.\n")
+        out = rtfm_search("consciousness", limit=3)
+        assert "modified since indexing" not in out
+
+    def test_expand_line_ranges_follow_the_repair(self, mcp_db, tmp_path, indexer):
+        """Boundaries are the thing that silently rots: shift the file down
+        and the old ranges point at the wrong lines."""
+        from rtfm.mcp import rtfm_expand
+
+        doc = tmp_path / "doc.md"
+        doc.write_text("<!-- three -->\n<!-- new -->\n<!-- lines -->\n"
+                       + doc.read_text())
+        out = rtfm_expand(str(doc))
+        assert "⚠" not in out
+        # Re-chunked: the first chunk is the new head of the file, and the
+        # numbers shown match the file as it is now.
+        assert "<!-- three -->" in out
+
+    def test_falls_back_to_reporting_when_the_budget_runs_out(
+            self, mcp_db, tmp_path, monkeypatch, indexer):
+        from rtfm.core import freshness
+        from rtfm.mcp import rtfm_search
+
+        monkeypatch.setattr(freshness, "wait_for", lambda *a, **k: False)
+        (tmp_path / "doc.md").write_text("# Philosophy\n\nconsciousness moved on.\n")
+        assert "modified since indexing" in rtfm_search("consciousness", limit=3)
+
+
+class TestTheServerNeverConjuresAnIndex:
+    """The plugin points ``RTFM_DB`` at the *relative* ``.rtfm/library.db``,
+    so the server aims at whatever directory the session was opened in.
+    Creating that database on open is how a 27 GB index appeared in a
+    directory nobody had ever indexed — a tree of twenty-six already-indexed
+    projects, their virtualenvs and their vendored dependencies, 151 416
+    files, three days and three cores."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_singleton(self, monkeypatch, tmp_path):
+        import rtfm.mcp as mcp_mod
+        monkeypatch.setattr(mcp_mod, "_library", None)
+        monkeypatch.chdir(tmp_path)
+        yield
+
+    def test_an_unindexed_directory_stays_unindexed(self, monkeypatch, tmp_path):
+        import rtfm.mcp as mcp_mod
+
+        monkeypatch.setenv("RTFM_DB", ".rtfm/library.db")
+        with pytest.raises(mcp_mod.NoIndexHere):
+            mcp_mod._get_library()
+
+        assert not (tmp_path / ".rtfm").exists(), \
+            "the server created an index in a directory nobody indexed"
+
+    def test_the_refusal_says_what_to_do(self, monkeypatch):
+        import rtfm.mcp as mcp_mod
+
+        monkeypatch.setenv("RTFM_DB", ".rtfm/library.db")
+        with pytest.raises(mcp_mod.NoIndexHere) as exc:
+            mcp_mod._get_library()
+        assert "rtfm init" in str(exc.value)
+
+    def test_an_existing_index_opens_normally(self, monkeypatch, tmp_path):
+        import rtfm.mcp as mcp_mod
+
+        (tmp_path / ".rtfm").mkdir()
+        Library(tmp_path / ".rtfm" / "library.db").close()
+        monkeypatch.setenv("RTFM_DB", str(tmp_path / ".rtfm" / "library.db"))
+        assert mcp_mod._get_library() is not None
+
+
+class TestReadingWhatHasNoLines:
+    """A PDF, an ebook, a spreadsheet: the text exists only as extracted.
+
+    `_render_chunk` read the source file to guarantee its line numbers match
+    what Read/Edit see. With no lines to read it gave up — so every search
+    over a PDF corpus named the right document and then served
+    "[file not available]". Searchable, unreadable.
+    """
+
+    def test_the_indexed_text_is_served_when_there_are_no_lines(self):
+        from rtfm.mcp import _render_chunk
+        passage = "Binaural beats entrain cortical oscillations."
+        assert _render_chunk("/some/paper.pdf", None, None, passage) == passage
+
+    def test_lines_still_win_when_the_file_has_them(self, tmp_path):
+        """A text file must keep reading live off disk — that is what keeps
+        the line numbers honest."""
+        from rtfm.mcp import _render_chunk
+        f = tmp_path / "a.py"
+        f.write_text("real line\n")
+        out = _render_chunk(str(f), 1, 1, "stale copy from the index")
+        assert "real line" in out
+        assert "stale copy" not in out
+
+    def test_without_any_text_the_message_is_unchanged(self):
+        from rtfm.mcp import _render_chunk
+        assert "not available" in _render_chunk("", None, None).lower()
+
+    def test_expand_serves_a_pdf_passage(self, tmp_path, monkeypatch):
+        """End to end: a book with no line information still reads."""
+        import rtfm.mcp as mcp
+        from rtfm.core.library import Library
+        from rtfm.core.models import Chunk
+
+        db = tmp_path / "library.db"
+        lib = Library(str(db))
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 binary")
+        passage = "Auditory beat stimulation and its effects on cognition."
+        lib._index_chunks([Chunk(
+            id="paper-p003-001", content=passage, book_title="Paper",
+            book_slug="paper", book_file=str(pdf), chapter_title="Page 3",
+            chapter_num=3, page_start=3, page_end=3, paragraph=1,
+            section_type="page", content_chars=len(passage),
+            content_hash="h",
+        )], corpus="papers", metadata={})
+        lib.close()
+
+        monkeypatch.setattr(mcp, "_library", None)
+        monkeypatch.setenv("RTFM_DB", str(db))
+        try:
+            out = mcp.rtfm_expand(str(pdf))
+            assert passage in out
+            assert "not available" not in out.lower()
+        finally:
+            mcp._library = None
